@@ -4,6 +4,8 @@ Discord voice channel overlay for Guild Wars 2, built as a [Nexus](https://raidc
 
 Shows who is in your current Discord voice channel, who is muted/deafened, and who is currently speaking — all rendered in-game via ImGui.
 
+![Overlay screenshot](images/overlay.png)
+
 ## How It Works
 
 Discordant connects to the locally running Discord desktop client via its WebSocket RPC server on `127.0.0.1:6463-6472`. It authenticates using Discord's StreamKit OAuth flow (the same mechanism used by the [Discover](https://github.com/trigg/Discover) overlay and OBS StreamKit).
