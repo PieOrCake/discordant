@@ -1,0 +1,20 @@
+# Build
+build/
+*.dll
+*.lib
+*.o
+*.obj
+
+# Dependencies (downloaded by setup.sh)
+lib/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
