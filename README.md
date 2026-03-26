@@ -6,6 +6,12 @@ Shows who is in your current Discord voice channel, who is muted/deafened, and w
 
 ![Overlay screenshot](images/overlay.png)
 
+## AI Notice
+
+This addon has been 100% created in [Windsurf](https://windsurf.com/) using Claude. I understand that some folks have a moral, financial or political objection to creating software using an LLM. I just wanted to make a useful tool for the GW2 community, and this was the only way I could do it.
+
+If an LLM creating software upsets you, then perhaps this repo isn't for you. Move on, and enjoy your day.
+
 ## How It Works
 
 Discordant connects to the locally running Discord desktop client via its WebSocket RPC server on `127.0.0.1:6463-6472`. It authenticates using Discord's StreamKit OAuth flow (the same mechanism used by the [Discover](https://github.com/trigg/Discover) overlay and OBS StreamKit).
