@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <shellapi.h>
 #include <string>
 #include <cstring>
 #include <fstream>
@@ -13,7 +14,7 @@
 #define V_MAJOR 0
 #define V_MINOR 9
 #define V_BUILD 0
-#define V_REVISION 0
+#define V_REVISION 1
 
 // Quick Access identifiers
 #define QA_ID "QA_DISCORDANT"
@@ -528,6 +529,13 @@ void AddonRender() {
 void AddonOptions() {
     if (!g_Discord) return;
     ImGui::Text("Discordant - Discord Voice Overlay");
+    if (ImGui::SmallButton("Homepage")) {
+        ShellExecuteA(NULL, "open", "https://pie.rocks.cc/", NULL, NULL, SW_SHOWNORMAL);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Buy me a coffee!")) {
+        ShellExecuteA(NULL, "open", "https://ko-fi.com/pieorcake", NULL, NULL, SW_SHOWNORMAL);
+    }
     ImGui::Spacing();
 
     DiscordState state = g_Discord->GetState();
