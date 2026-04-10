@@ -79,6 +79,16 @@ std::string DiscordClient::GetChannelIconName() {
     return m_channelIconName;
 }
 
+VoiceSnapshot DiscordClient::GetVoiceSnapshot() {
+    std::lock_guard<std::mutex> lock(m_userMutex);
+    VoiceSnapshot snap;
+    snap.users = m_users;
+    snap.channelName = m_channelName;
+    snap.channelIconId = m_channelIconId;
+    snap.channelIconName = m_channelIconName;
+    return snap;
+}
+
 void DiscordClient::QueueLog(const std::string& msg) {
     std::lock_guard<std::mutex> lock(m_logMutex);
     m_logQueue.push_back(msg);

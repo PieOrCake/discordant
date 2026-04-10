@@ -3,6 +3,7 @@
 #include <string>
 #include <cstring>
 #include <fstream>
+#include <unordered_map>
 
 #include "nexus/Nexus.h"
 #include "imgui.h"
@@ -14,7 +15,7 @@
 #define V_MAJOR 0
 #define V_MINOR 9
 #define V_BUILD 0
-#define V_REVISION 1
+#define V_REVISION 2
 
 // Quick Access identifiers
 #define QA_ID "QA_DISCORDANT"
@@ -172,20 +173,59 @@ static void RenderUserDot(const VoiceUser& user) {
     ImGui::SameLine();
 }
 
-static void RenderUserAvatar(const VoiceUser& user) {
+// Avatar texture cache: keyed by "userId:avatarHash", value is cached Texture_t*
+struct AvatarCacheEntry {
+    Texture_t* tex = nullptr;
+    bool requested = false;
+};
+static std::unordered_map<std::string, AvatarCacheEntry> s_avatarCache;
+
+// Channel icon texture cache
+static std::string s_chanIconCacheKey;
+static AvatarCacheEntry s_chanIconCache;
+
+static Texture_t* GetCachedAvatarTexture(const VoiceUser& user) {
+    if (user.avatar.empty()) return nullptr;
+    std::string key = user.id + ":" + user.avatar;
+    auto it = s_avatarCache.find(key);
+    if (it != s_avatarCache.end()) {
+        if (it->second.tex && it->second.tex->Resource) return it->second.tex;
+        if (it->second.requested) return nullptr; // still loading
+    }
+    // First request or texture not yet ready — call API once
+    std::string texId = "TEX_AVATAR_" + user.id;
+    std::string endpoint = "/avatars/" + user.id + "/" + user.avatar + ".png?size=32";
+    Texture_t* tex = APIDefs->Textures_GetOrCreateFromURL(texId.c_str(), "https://cdn.discordapp.com", endpoint.c_str());
+    AvatarCacheEntry entry;
+    entry.tex = tex;
+    entry.requested = true;
+    s_avatarCache[key] = entry;
+    return (tex && tex->Resource) ? tex : nullptr;
+}
+
+static Texture_t* GetCachedChannelIconTexture(const std::string& iconId) {
+    if (iconId.empty()) return nullptr;
+    if (s_chanIconCacheKey == iconId && s_chanIconCache.tex && s_chanIconCache.tex->Resource) {
+        return s_chanIconCache.tex;
+    }
+    if (s_chanIconCacheKey == iconId && s_chanIconCache.requested) {
+        return nullptr; // still loading
+    }
+    std::string texId = "TEX_CHANICON_" + iconId;
+    std::string endpoint = "/emojis/" + iconId + ".png?size=32";
+    Texture_t* tex = APIDefs->Textures_GetOrCreateFromURL(texId.c_str(), "https://cdn.discordapp.com", endpoint.c_str());
+    s_chanIconCacheKey = iconId;
+    s_chanIconCache.tex = tex;
+    s_chanIconCache.requested = true;
+    return (tex && tex->Resource) ? tex : nullptr;
+}
+
+static void RenderUserAvatar(const VoiceUser& user, Texture_t* tex) {
     float iconSize = 24.0f;
     float iconRadius = iconSize * 0.5f;
     ImVec2 pos = ImGui::GetCursorScreenPos();
     ImVec2 center = ImVec2(pos.x + iconRadius, pos.y + iconRadius);
     ImDrawList* dl = ImGui::GetWindowDrawList();
-
-    // Build avatar texture identifier and URL
-    std::string texId = "TEX_AVATAR_" + user.id;
-    Texture_t* tex = nullptr;
-    if (!user.avatar.empty()) {
-        std::string endpoint = "/avatars/" + user.id + "/" + user.avatar + ".png?size=32";
-        tex = APIDefs->Textures_GetOrCreateFromURL(texId.c_str(), "https://cdn.discordapp.com", endpoint.c_str());
-    }
 
     if (tex && tex->Resource) {
         // Clip avatar to circle using draw list
@@ -231,31 +271,45 @@ static void RenderUserAvatar(const VoiceUser& user) {
     ImGui::SameLine(0, 4);
 }
 
-static void RenderChannelIcon(const std::string& iconId, const std::string& iconName, float size) {
-    // Only render custom emojis (have an ID we can load from CDN)
-    // Unicode emojis are skipped since ImGui's default font can't render them
-    if (iconId.empty()) return;
-
-    std::string texId = "TEX_CHANICON_" + iconId;
-    std::string endpoint = "/emojis/" + iconId + ".png?size=32";
-    Texture_t* tex = APIDefs->Textures_GetOrCreateFromURL(texId.c_str(), "https://cdn.discordapp.com", endpoint.c_str());
-    if (tex && tex->Resource) {
-        ImVec2 pos = ImGui::GetCursorScreenPos();
-        ImGui::GetWindowDrawList()->AddImageRounded(
-            (ImTextureID)tex->Resource,
-            pos, ImVec2(pos.x + size, pos.y + size),
-            ImVec2(0, 0), ImVec2(1, 1),
-            IM_COL32(255, 255, 255, 255), 2.0f);
-        ImGui::Dummy(ImVec2(size, size));
-        ImGui::SameLine(0, 4);
-    }
+static void RenderChannelIcon(Texture_t* tex, float size) {
+    if (!tex || !tex->Resource) return;
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImGui::GetWindowDrawList()->AddImageRounded(
+        (ImTextureID)tex->Resource,
+        pos, ImVec2(pos.x + size, pos.y + size),
+        ImVec2(0, 0), ImVec2(1, 1),
+        IM_COL32(255, 255, 255, 255), 2.0f);
+    ImGui::Dummy(ImVec2(size, size));
+    ImGui::SameLine(0, 4);
 }
 
 static void RenderVoiceOverlay() {
-    auto users = g_Discord->GetVoiceUsers();
-    std::string channelName = g_Discord->GetChannelName();
-    std::string channelIconId = g_Discord->GetChannelIconId();
-    std::string channelIconName = g_Discord->GetChannelIconName();
+    // Single mutex lock for all shared voice state
+    VoiceSnapshot snap = g_Discord->GetVoiceSnapshot();
+    auto& users = snap.users;
+    auto& channelName = snap.channelName;
+
+    // Pre-resolve textures from cache (avoids per-user string concat in render loop)
+    Texture_t* chanIconTex = GetCachedChannelIconTexture(snap.channelIconId);
+    static std::vector<Texture_t*> s_userTextures;
+    s_userTextures.clear();
+    s_userTextures.reserve(users.size());
+    for (const auto& u : users) {
+        s_userTextures.push_back(GetCachedAvatarTexture(u));
+    }
+
+    // Evict stale avatar cache entries for users no longer in channel
+    if (s_avatarCache.size() > users.size() + 8) {
+        std::unordered_map<std::string, AvatarCacheEntry> fresh;
+        for (const auto& u : users) {
+            if (!u.avatar.empty()) {
+                std::string key = u.id + ":" + u.avatar;
+                auto it = s_avatarCache.find(key);
+                if (it != s_avatarCache.end()) fresh[key] = it->second;
+            }
+        }
+        s_avatarCache.swap(fresh);
+    }
 
     bool hasContent = !users.empty() || !channelName.empty();
     if (!hasContent && g_LockPosition) return;  // Nothing to show and locked — hide
@@ -366,7 +420,7 @@ static void RenderVoiceOverlay() {
 
         if (g_ShowChannelName && !channelName.empty() && !g_GrowUpward) {
             float iconSize = ImGui::GetTextLineHeight();
-            RenderChannelIcon(channelIconId, channelIconName, iconSize);
+            RenderChannelIcon(chanIconTex, iconSize);
             ImGui::TextColored(colHeader, "%s", channelName.c_str());
             ImGui::Separator();
         }
@@ -374,9 +428,10 @@ static void RenderVoiceOverlay() {
         // Render users in reverse order when growing upward
         int userCount = (int)users.size();
         for (int ui = 0; ui < userCount; ui++) {
-            const auto& user = g_GrowUpward ? users[userCount - 1 - ui] : users[ui];
+            int idx = g_GrowUpward ? (userCount - 1 - ui) : ui;
+            const auto& user = users[idx];
             if (g_ShowAvatars) {
-                RenderUserAvatar(user);
+                RenderUserAvatar(user, s_userTextures[idx]);
             } else {
                 RenderUserDot(user);
             }
@@ -408,7 +463,7 @@ static void RenderVoiceOverlay() {
         if (g_ShowChannelName && !channelName.empty() && g_GrowUpward) {
             ImGui::Separator();
             float iconSize = ImGui::GetTextLineHeight();
-            RenderChannelIcon(channelIconId, channelIconName, iconSize);
+            RenderChannelIcon(chanIconTex, iconSize);
             ImGui::TextColored(colHeader, "%s", channelName.c_str());
         }
 
@@ -500,14 +555,15 @@ void AddonUnload() {
 void AddonRender() {
     if (!g_Discord) return;
 
-    // Flush Discord log queue to Nexus log (must be done on render thread)
-    auto logs = g_Discord->DrainLogQueue();
-    if (!logs.empty()) {
-        char countBuf[64];
-        snprintf(countBuf, sizeof(countBuf), "Draining %d log messages", (int)logs.size());
-        APIDefs->Log(LOGL_INFO, "Discordant", countBuf);
-        for (const auto& msg : logs) {
-            APIDefs->Log(LOGL_INFO, "Discordant", msg.c_str());
+    // Flush Discord log queue to Nexus log (throttled to every 30 frames)
+    static int s_logFrameCount = 0;
+    if (++s_logFrameCount >= 30) {
+        s_logFrameCount = 0;
+        auto logs = g_Discord->DrainLogQueue();
+        if (!logs.empty()) {
+            for (const auto& msg : logs) {
+                APIDefs->Log(LOGL_INFO, "Discordant", msg.c_str());
+            }
         }
     }
 

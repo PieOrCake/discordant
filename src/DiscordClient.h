@@ -20,6 +20,14 @@ struct VoiceUser {
     bool speaking = false;
 };
 
+// Snapshot of all voice state needed for rendering (grabbed in one lock)
+struct VoiceSnapshot {
+    std::vector<VoiceUser> users;
+    std::string channelName;
+    std::string channelIconId;
+    std::string channelIconName;
+};
+
 // Connection state for the Discord RPC client
 enum class DiscordState {
     Disconnected,
@@ -61,6 +69,9 @@ public:
     // Get channel icon info (custom emoji ID or unicode emoji name).
     std::string GetChannelIconId();
     std::string GetChannelIconName();
+
+    // Get all voice state in one lock (avoids 4 separate mutex acquisitions per frame).
+    VoiceSnapshot GetVoiceSnapshot();
 
     // Get connection status text for display.
     std::string GetStatusText() const;
