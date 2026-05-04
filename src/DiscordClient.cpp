@@ -218,9 +218,23 @@ void DiscordClient::SendCommand(const std::string& cmd, const std::string& args,
     m_ws.SendText(j.dump());
 }
 
+static VoiceUser ParseVoiceUserFromJSON(const nlohmann::json& d) {
+    VoiceUser u;
+    u.id       = d["user"].value("id", "");
+    u.username = d["user"].value("username", "");
+    u.avatar   = d["user"].contains("avatar") && d["user"]["avatar"].is_string()
+                     ? d["user"]["avatar"].get<std::string>() : "";
+    u.nick     = d.contains("nick") && d["nick"].is_string()
+                     ? d["nick"].get<std::string>() : "";
+    if (d.contains("voice_state")) {
+        const auto& vs = d["voice_state"];
+        u.mute = vs.value("mute", false) || vs.value("self_mute", false) || vs.value("suppress", false);
+        u.deaf = vs.value("deaf", false) || vs.value("self_deaf", false);
+    }
+    return u;
+}
+
 void DiscordClient::HandleMessage(const std::string& message) {
-    // Log raw message for diagnostics (truncated)
-    QueueLog("RPC recv: " + message.substr(0, 200));
 
     json j;
     try {
@@ -247,44 +261,21 @@ void DiscordClient::HandleMessage(const std::string& message) {
 
         if (evt == "VOICE_STATE_UPDATE") {
             std::lock_guard<std::mutex> lock(m_userMutex);
-            auto& d = j["data"];
-            VoiceUser u;
-            u.id = d["user"].value("id", "");
-            u.username = d["user"].value("username", "");
-            u.avatar = d["user"].contains("avatar") && d["user"]["avatar"].is_string() ? d["user"]["avatar"].get<std::string>() : "";
-            u.nick = d.contains("nick") && d["nick"].is_string() ? d["nick"].get<std::string>() : "";
-            auto& vs = d["voice_state"];
-            u.mute = vs.value("mute", false) || vs.value("self_mute", false) || vs.value("suppress", false);
-            u.deaf = vs.value("deaf", false) || vs.value("self_deaf", false);
+            VoiceUser u = ParseVoiceUserFromJSON(j["data"]);
             UpdateUser(u.id, u);
-            // Ensure user is in room
-            if (std::find(m_inRoom.begin(), m_inRoom.end(), u.id) == m_inRoom.end()) {
+            if (std::find(m_inRoom.begin(), m_inRoom.end(), u.id) == m_inRoom.end())
                 m_inRoom.push_back(u.id);
-            }
             return;
         }
 
         if (evt == "VOICE_STATE_CREATE") {
             std::lock_guard<std::mutex> lock(m_userMutex);
-            auto& d = j["data"];
-            VoiceUser u;
-            u.id = d["user"].value("id", "");
-            u.username = d["user"].value("username", "");
-            u.avatar = d["user"].contains("avatar") && d["user"]["avatar"].is_string() ? d["user"]["avatar"].get<std::string>() : "";
-            u.nick = d.contains("nick") && d["nick"].is_string() ? d["nick"].get<std::string>() : "";
-            if (d.contains("voice_state")) {
-                auto& vs = d["voice_state"];
-                u.mute = vs.value("mute", false) || vs.value("self_mute", false) || vs.value("suppress", false);
-                u.deaf = vs.value("deaf", false) || vs.value("self_deaf", false);
-            }
+            VoiceUser u = ParseVoiceUserFromJSON(j["data"]);
             UpdateUser(u.id, u);
-            if (std::find(m_inRoom.begin(), m_inRoom.end(), u.id) == m_inRoom.end()) {
+            if (std::find(m_inRoom.begin(), m_inRoom.end(), u.id) == m_inRoom.end())
                 m_inRoom.push_back(u.id);
-            }
-            // If it's us, find our channel
-            if (u.id == m_userId) {
+            if (u.id == m_userId)
                 RequestSelectedVoiceChannel();
-            }
             return;
         }
 
@@ -443,19 +434,9 @@ void DiscordClient::HandleMessage(const std::string& message) {
             m_inRoom.clear();
 
             if (d.contains("voice_states") && d["voice_states"].is_array()) {
-                for (auto& vs : d["voice_states"]) {
-                    VoiceUser u;
-                    u.id = vs["user"].value("id", "");
-                    u.username = vs["user"].value("username", "");
-                    u.avatar = vs["user"].contains("avatar") && vs["user"]["avatar"].is_string() ? vs["user"]["avatar"].get<std::string>() : "";
-                    u.nick = vs.contains("nick") && vs["nick"].is_string() ? vs["nick"].get<std::string>() : "";
-                    if (vs.contains("voice_state")) {
-                        auto& vstate = vs["voice_state"];
-                        u.mute = vstate.value("mute", false) || vstate.value("self_mute", false) || vstate.value("suppress", false);
-                        u.deaf = vstate.value("deaf", false) || vstate.value("self_deaf", false);
-                    }
-                    m_users.push_back(u);
-                    m_inRoom.push_back(u.id);
+                for (const auto& vs : d["voice_states"]) {
+                    m_users.push_back(ParseVoiceUserFromJSON(vs));
+                    m_inRoom.push_back(m_users.back().id);
                 }
             }
         }
