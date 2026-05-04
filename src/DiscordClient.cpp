@@ -189,6 +189,8 @@ void DiscordClient::NetworkThreadMain() {
                 std::lock_guard<std::mutex> lock(m_userMutex);
                 m_users.clear();
                 m_channelName.clear();
+                m_channelIconId.clear();
+                m_channelIconName.clear();
             }
             Sleep(100);
             continue;
