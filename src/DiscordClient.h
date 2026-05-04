@@ -91,10 +91,6 @@ private:
     static constexpr int RPC_PORT_MIN = 6463;
     static constexpr int RPC_PORT_MAX = 6472;
 
-    // Send a JSON command over the WebSocket.
-    void SendCommand(const std::string& cmd, const std::string& args,
-                     const std::string& evt = "", const std::string& nonce = "");
-
     // Process a received JSON message.
     void HandleMessage(const std::string& message);
 

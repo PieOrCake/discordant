@@ -207,16 +207,6 @@ void DiscordClient::NetworkThreadMain() {
     }
 }
 
-void DiscordClient::SendCommand(const std::string& cmd, const std::string& args,
-                                const std::string& evt, const std::string& nonce) {
-    json j;
-    j["cmd"] = cmd;
-    j["args"] = json::parse(args);
-    if (!evt.empty()) j["evt"] = evt;
-    j["nonce"] = nonce.empty() ? "discordant" : nonce;
-    m_ws.SendText(j.dump());
-}
-
 static VoiceUser ParseVoiceUserFromJSON(const nlohmann::json& d) {
     VoiceUser u;
     u.id       = d["user"].value("id", "");
@@ -434,7 +424,7 @@ void DiscordClient::StartAuthorize() {
     m_state.store(DiscordState::Authorizing);
     json args;
     args["client_id"] = STREAMKIT_CLIENT_ID;
-    args["scopes"] = json::array({"rpc", "messages.read", "rpc.notifications.read"});
+    args["scopes"] = json::array({"rpc"});
     args["prompt"] = "consent";
 
     json j;
