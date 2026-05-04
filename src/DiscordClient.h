@@ -137,8 +137,7 @@ private:
 
     // Voice user list
     std::mutex m_userMutex;
-    std::vector<VoiceUser> m_users;
-    std::vector<std::string> m_inRoom; // ordered user IDs
+    std::vector<VoiceUser> m_users;  // maintained in channel join order
 
     // Token exchange runs on a background thread
     bool m_tokenExchangePending = false;

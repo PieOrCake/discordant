@@ -45,23 +45,12 @@ void DiscordClient::Disconnect() {
     {
         std::lock_guard<std::mutex> lock(m_userMutex);
         m_users.clear();
-        m_inRoom.clear();
     }
 }
 
 std::vector<VoiceUser> DiscordClient::GetVoiceUsers() {
     std::lock_guard<std::mutex> lock(m_userMutex);
-    // Return users in room order
-    std::vector<VoiceUser> result;
-    for (const auto& uid : m_inRoom) {
-        for (const auto& u : m_users) {
-            if (u.id == uid) {
-                result.push_back(u);
-                break;
-            }
-        }
-    }
-    return result;
+    return m_users;
 }
 
 std::string DiscordClient::GetChannelName() {
@@ -186,13 +175,12 @@ void DiscordClient::NetworkThreadMain() {
         if (m_ws.GetState() != WebSocket::State::Connected) {
             m_state.store(DiscordState::Disconnected);
             m_reconnectAt = GetTickCount64() + 10000;
+            m_currentVoice.clear();
             {
                 std::lock_guard<std::mutex> lock(m_userMutex);
                 m_users.clear();
-                m_inRoom.clear();
+                m_channelName.clear();
             }
-            m_currentVoice.clear();
-            m_channelName.clear();
             Sleep(100);
             continue;
         }
@@ -263,8 +251,6 @@ void DiscordClient::HandleMessage(const std::string& message) {
             std::lock_guard<std::mutex> lock(m_userMutex);
             VoiceUser u = ParseVoiceUserFromJSON(j["data"]);
             UpdateUser(u.id, u);
-            if (std::find(m_inRoom.begin(), m_inRoom.end(), u.id) == m_inRoom.end())
-                m_inRoom.push_back(u.id);
             return;
         }
 
@@ -272,8 +258,6 @@ void DiscordClient::HandleMessage(const std::string& message) {
             std::lock_guard<std::mutex> lock(m_userMutex);
             VoiceUser u = ParseVoiceUserFromJSON(j["data"]);
             UpdateUser(u.id, u);
-            if (std::find(m_inRoom.begin(), m_inRoom.end(), u.id) == m_inRoom.end())
-                m_inRoom.push_back(u.id);
             if (u.id == m_userId)
                 RequestSelectedVoiceChannel();
             return;
@@ -283,12 +267,8 @@ void DiscordClient::HandleMessage(const std::string& message) {
             std::lock_guard<std::mutex> lock(m_userMutex);
             std::string uid = j["data"]["user"].value("id", "");
             RemoveUser(uid);
-            m_inRoom.erase(std::remove(m_inRoom.begin(), m_inRoom.end(), uid), m_inRoom.end());
-            if (uid == m_userId) {
-                m_inRoom.clear();
+            if (uid == m_userId)
                 m_users.clear();
-                RequestSelectedVoiceChannel();
-            }
             return;
         }
 
@@ -297,10 +277,6 @@ void DiscordClient::HandleMessage(const std::string& message) {
             std::string uid = j["data"].value("user_id", "");
             for (auto& u : m_users) {
                 if (u.id == uid) { u.speaking = true; break; }
-            }
-            // Ensure user is tracked as in room
-            if (std::find(m_inRoom.begin(), m_inRoom.end(), uid) == m_inRoom.end()) {
-                m_inRoom.push_back(uid);
             }
             return;
         }
@@ -326,7 +302,6 @@ void DiscordClient::HandleMessage(const std::string& message) {
                     {
                         std::lock_guard<std::mutex> lock(m_userMutex);
                         m_users.clear();
-                        m_inRoom.clear();
                     }
                     SubscribeVoiceChannel(chId);
                     m_currentVoice = chId;
@@ -341,7 +316,6 @@ void DiscordClient::HandleMessage(const std::string& message) {
                 {
                     std::lock_guard<std::mutex> lock(m_userMutex);
                     m_users.clear();
-                    m_inRoom.clear();
                     m_channelName.clear();
                     m_channelIconId.clear();
                     m_channelIconName.clear();
@@ -400,7 +374,6 @@ void DiscordClient::HandleMessage(const std::string& message) {
             {
                 std::lock_guard<std::mutex> lock(m_userMutex);
                 m_users.clear();
-                m_inRoom.clear();
                 m_channelName.clear();
             }
             return;
@@ -431,12 +404,10 @@ void DiscordClient::HandleMessage(const std::string& message) {
                 m_channelIconName = ie.contains("name") && ie["name"].is_string() ? ie["name"].get<std::string>() : "";
             }
             m_users.clear();
-            m_inRoom.clear();
 
             if (d.contains("voice_states") && d["voice_states"].is_array()) {
                 for (const auto& vs : d["voice_states"]) {
                     m_users.push_back(ParseVoiceUserFromJSON(vs));
-                    m_inRoom.push_back(m_users.back().id);
                 }
             }
         }
