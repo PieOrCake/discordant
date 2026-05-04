@@ -29,9 +29,10 @@ void DiscordClient::Connect() {
 
 void DiscordClient::Disconnect() {
     m_running.store(false);
-    if (m_networkThread.joinable()) {
+    if (m_networkThread.joinable())
         m_networkThread.join();
-    }
+    if (m_tokenThread.joinable())
+        m_tokenThread.join();
     if (!m_currentVoice.empty()) {
         // Don't send unsubscribe after thread stopped — ws is closed
     }
@@ -107,19 +108,27 @@ void DiscordClient::NetworkThreadMain() {
     QueueLog("Network thread started");
     while (m_running.load()) {
         // Handle token exchange completion
-        if (m_tokenExchangePending) {
-            if (m_tokenExchangeFailed) {
-                m_tokenExchangePending = false;
-                m_tokenExchangeFailed = false;
+        if (m_tokenExchangePending.load()) {
+            if (m_tokenExchangeFailed.load()) {
+                m_tokenExchangePending.store(false);
+                m_tokenExchangeFailed.store(false);
                 m_state.store(DiscordState::Disconnected);
                 m_reconnectAt = GetTickCount64() + 30000;
                 Sleep(100);
                 continue;
             }
-            if (!m_pendingAccessToken.empty()) {
-                m_accessToken = m_pendingAccessToken;
-                m_pendingAccessToken.clear();
-                m_tokenExchangePending = false;
+            std::string token;
+            {
+                std::lock_guard<std::mutex> lock(m_tokenMutex);
+                token = m_pendingAccessToken;
+            }
+            if (!token.empty()) {
+                m_accessToken = token;
+                {
+                    std::lock_guard<std::mutex> lock(m_tokenMutex);
+                    m_pendingAccessToken.clear();
+                }
+                m_tokenExchangePending.store(false);
                 Authenticate();
                 Sleep(16);
                 continue;
@@ -436,21 +445,26 @@ void DiscordClient::StartAuthorize() {
 void DiscordClient::ExchangeToken(const std::string& code) {
     QueueLog("ExchangeToken: starting with code " + code.substr(0, 8) + "...");
     m_state.store(DiscordState::ExchangingToken);
-    m_tokenExchangePending = true;
-    m_tokenExchangeFailed = false;
-    m_pendingAccessToken.clear();
+    m_tokenExchangePending.store(true);
+    m_tokenExchangeFailed.store(false);
+    {
+        std::lock_guard<std::mutex> lock(m_tokenMutex);
+        m_pendingAccessToken.clear();
+    }
 
-    // Background thread for HTTP POST to StreamKit token endpoint
+    if (m_tokenThread.joinable())
+        m_tokenThread.join();
+
     std::string codeCopy = code;
-    std::thread([this, codeCopy]() {
+    m_tokenThread = std::thread([this, codeCopy]() {
         QueueLog("ExchangeToken thread: InternetOpenA...");
         HINTERNET hInet = InternetOpenA("Discordant/1.0", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
-        if (!hInet) { QueueLog("ExchangeToken: InternetOpenA failed"); m_tokenExchangeFailed = true; return; }
+        if (!hInet) { QueueLog("ExchangeToken: InternetOpenA failed"); m_tokenExchangeFailed.store(true); return; }
 
         QueueLog("ExchangeToken thread: InternetConnectA to streamkit.discord.com...");
         HINTERNET hConn = InternetConnectA(hInet, "streamkit.discord.com",
             INTERNET_DEFAULT_HTTPS_PORT, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 0);
-        if (!hConn) { QueueLog("ExchangeToken: InternetConnectA failed"); InternetCloseHandle(hInet); m_tokenExchangeFailed = true; return; }
+        if (!hConn) { QueueLog("ExchangeToken: InternetConnectA failed"); InternetCloseHandle(hInet); m_tokenExchangeFailed.store(true); return; }
 
         const char* acceptTypes[] = {"application/json", NULL};
         HINTERNET hReq = HttpOpenRequestA(hConn, "POST", "/overlay/token",
@@ -459,7 +473,7 @@ void DiscordClient::ExchangeToken(const std::string& code) {
             QueueLog("ExchangeToken: HttpOpenRequestA failed");
             InternetCloseHandle(hConn);
             InternetCloseHandle(hInet);
-            m_tokenExchangeFailed = true;
+            m_tokenExchangeFailed.store(true);
             return;
         }
 
@@ -476,16 +490,15 @@ void DiscordClient::ExchangeToken(const std::string& code) {
             InternetCloseHandle(hReq);
             InternetCloseHandle(hConn);
             InternetCloseHandle(hInet);
-            m_tokenExchangeFailed = true;
+            m_tokenExchangeFailed.store(true);
             return;
         }
 
         char buf[4096];
         DWORD bytesRead = 0;
         std::string response;
-        while (InternetReadFile(hReq, buf, sizeof(buf), &bytesRead) && bytesRead > 0) {
+        while (InternetReadFile(hReq, buf, sizeof(buf), &bytesRead) && bytesRead > 0)
             response.append(buf, bytesRead);
-        }
 
         InternetCloseHandle(hReq);
         InternetCloseHandle(hConn);
@@ -496,17 +509,20 @@ void DiscordClient::ExchangeToken(const std::string& code) {
         try {
             auto rj = json::parse(response);
             if (rj.contains("access_token")) {
-                m_pendingAccessToken = rj["access_token"].get<std::string>();
+                {
+                    std::lock_guard<std::mutex> lock(m_tokenMutex);
+                    m_pendingAccessToken = rj["access_token"].get<std::string>();
+                }
                 QueueLog("ExchangeToken: got access token");
             } else {
                 QueueLog("ExchangeToken: no access_token in response");
-                m_tokenExchangeFailed = true;
+                m_tokenExchangeFailed.store(true);
             }
         } catch (...) {
             QueueLog("ExchangeToken: JSON parse failed");
-            m_tokenExchangeFailed = true;
+            m_tokenExchangeFailed.store(true);
         }
-    }).detach();
+    });
 }
 
 void DiscordClient::Authenticate() {

@@ -140,9 +140,11 @@ private:
     std::vector<VoiceUser> m_users;  // maintained in channel join order
 
     // Token exchange runs on a background thread
-    bool m_tokenExchangePending = false;
-    std::string m_pendingAccessToken;
-    bool m_tokenExchangeFailed = false;
+    std::atomic<bool> m_tokenExchangePending{false};
+    std::atomic<bool> m_tokenExchangeFailed{false};
+    std::mutex m_tokenMutex;
+    std::string m_pendingAccessToken;  // protected by m_tokenMutex
+    std::thread m_tokenThread;
 
     // Thread-safe log queue (written by network thread, drained by render thread)
     void QueueLog(const std::string& msg);
