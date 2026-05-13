@@ -12,6 +12,7 @@
 
 #include "DiscordClient.h"
 #include "RichPresence.h"
+#include "DiscordIPC.h"
 
 // Version constants
 #define V_MAJOR 0
@@ -71,6 +72,7 @@ static Mumble::Identity  g_MumbleIdentity{};
 
 // Rich Presence
 static RichPresence* g_RichPresence = nullptr;
+static DiscordIPC*   g_DiscordIPC   = nullptr;
 static RPConfig      g_RPConfig{};
 static char          g_RPAppIdOverride[64] = {0};
 
@@ -80,6 +82,12 @@ static char g_ConfigPath[MAX_PATH] = {0};
 static void OnMumbleIdentityUpdated(void* eventArgs) {
     if (!eventArgs) return;
     g_MumbleIdentity = *reinterpret_cast<const Mumble::Identity*>(eventArgs);
+}
+
+static std::string GetEffectiveAppId() {
+    if (g_RPAppIdOverride[0] != '\0')
+        return std::string(g_RPAppIdOverride);
+    return DISCORD_APP_ID;
 }
 
 // Forward declarations
@@ -167,6 +175,8 @@ static void SaveConfig() {
         j["rp_show_prof"]  = g_RPConfig.showProfession;
         j["rp_show_party"] = g_RPConfig.showPartySize;
         j["rp_app_id"] = std::string(g_RPAppIdOverride);
+        if (g_DiscordIPC)
+            g_DiscordIPC->SetAppId(GetEffectiveAppId());
         auto saveCol = [](float* c) -> nlohmann::json { return {c[0], c[1], c[2], c[3]}; };
         j["col_speaking"] = saveCol(g_ColSpeaking);
         j["col_silent"] = saveCol(g_ColSilent);
@@ -534,7 +544,9 @@ void AddonLoad(AddonAPI_t* aApi) {
 
     // Allocate Discord client on heap (not as global to avoid DllMain issues)
     g_Discord = new DiscordClient();
-    g_RichPresence = new RichPresence(g_Discord);
+    g_DiscordIPC = new DiscordIPC();
+    g_DiscordIPC->Start(GetEffectiveAppId());
+    g_RichPresence = new RichPresence(g_DiscordIPC);
     g_MumbleLink = (Mumble::Data*)APIDefs->DataLink_Get(DL_MUMBLE_LINK);
     APIDefs->Events_Subscribe("EV_MUMBLE_IDENTITY_UPDATED", OnMumbleIdentityUpdated);
 
@@ -576,6 +588,12 @@ void AddonUnload() {
         g_RichPresence->Shutdown();
         delete g_RichPresence;
         g_RichPresence = nullptr;
+    }
+
+    if (g_DiscordIPC) {
+        g_DiscordIPC->Stop();
+        delete g_DiscordIPC;
+        g_DiscordIPC = nullptr;
     }
 
     if (g_Discord) {
@@ -692,7 +710,7 @@ void AddonOptions() {
         if (ImGui::InputText("Application ID", g_RPAppIdOverride, sizeof(g_RPAppIdOverride)))
             SaveConfig();
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Custom application ID support is reserved for a future update.");
+            ImGui::SetTooltip("Your Discord Application ID. Leave blank to use the built-in ID. Changes take effect immediately.");
 
         if (ImGui::Checkbox("Show character name", &g_RPConfig.showCharName)) SaveConfig();
         if (ImGui::Checkbox("Show current map",    &g_RPConfig.showMap))      SaveConfig();
