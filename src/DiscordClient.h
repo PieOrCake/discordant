@@ -79,12 +79,6 @@ public:
     // Drain pending log messages (call from render thread to forward to Nexus log).
     std::vector<std::string> DrainLogQueue();
 
-    // Set or clear the Discord Rich Presence activity.
-    // activityJson must be a complete Discord RPC envelope: {"cmd":"SET_ACTIVITY","nonce":"...","args":{...}}
-    // Thread-safe: queues payload for the network thread to send.
-    void SetActivity(const std::string& activityJson);
-    void ClearActivity();
-
     // Whether the local user is muted/deafened
     bool IsSelfMuted() const { return m_selfMuted; }
     bool IsSelfDeafened() const { return m_selfDeafened; }
@@ -152,11 +146,6 @@ private:
     void QueueLog(const std::string& msg);
     std::vector<std::string> m_logQueue;
     std::mutex m_logMutex;
-
-    // Pending Rich Presence activity (written by render thread, sent by network thread)
-    std::mutex m_activityMutex;
-    std::string m_pendingActivity;
-    std::atomic<bool> m_activityPending{false};
 };
 
 #endif // DISCORDANT_DISCORD_CLIENT_H

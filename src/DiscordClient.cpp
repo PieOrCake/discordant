@@ -91,21 +91,6 @@ std::vector<std::string> DiscordClient::DrainLogQueue() {
     return out;
 }
 
-void DiscordClient::SetActivity(const std::string& activityJson) {
-    std::lock_guard<std::mutex> lock(m_activityMutex);
-    m_pendingActivity = activityJson;
-    m_activityPending.store(true);
-}
-
-void DiscordClient::ClearActivity() {
-    nlohmann::json j;
-    j["cmd"]  = "SET_ACTIVITY";
-    j["nonce"] = "rp_clear";
-    j["args"]["pid"] = (int)GetCurrentProcessId();
-    j["args"]["activity"] = nullptr;
-    SetActivity(j.dump());
-}
-
 std::string DiscordClient::GetStatusText() const {
     switch (m_state.load()) {
     case DiscordState::Disconnected:    return "Disconnected";
@@ -215,18 +200,6 @@ void DiscordClient::NetworkThreadMain() {
         auto messages = m_ws.Poll();
         for (const auto& msg : messages) {
             HandleMessage(msg);
-        }
-
-        // Send queued Rich Presence activity update
-        if (m_activityPending.load() && m_state.load() == DiscordState::Connected) {
-            std::string act;
-            {
-                std::lock_guard<std::mutex> lock(m_activityMutex);
-                act = m_pendingActivity;
-                m_pendingActivity.clear();
-                m_activityPending.store(false);   // clear flag while still holding lock
-            }
-            m_ws.SendText(act);
         }
 
         // Sleep briefly to avoid busy-spinning
@@ -465,7 +438,7 @@ void DiscordClient::StartAuthorize() {
     m_state.store(DiscordState::Authorizing);
     json args;
     args["client_id"] = STREAMKIT_CLIENT_ID;
-    args["scopes"] = json::array({"rpc", "rpc.activities.write"});
+    args["scopes"] = json::array({"rpc"});
     args["prompt"] = "consent";
 
     json j;
