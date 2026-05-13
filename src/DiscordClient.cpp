@@ -224,8 +224,8 @@ void DiscordClient::NetworkThreadMain() {
                 std::lock_guard<std::mutex> lock(m_activityMutex);
                 act = m_pendingActivity;
                 m_pendingActivity.clear();
+                m_activityPending.store(false);   // clear flag while still holding lock
             }
-            m_activityPending.store(false);
             m_ws.SendText(act);
         }
 
@@ -280,7 +280,9 @@ void DiscordClient::HandleMessage(const std::string& message) {
                 std::lock_guard<std::mutex> lock(m_userMutex);
                 VoiceUser u = ParseVoiceUserFromJSON(j["data"]);
                 UpdateUser(u.id, u);
-            } catch (...) {}
+            } catch (...) {
+                QueueLog("HandleMessage: voice state parse error");
+            }
             return;
         }
 
@@ -291,7 +293,9 @@ void DiscordClient::HandleMessage(const std::string& message) {
                 UpdateUser(u.id, u);
                 if (u.id == m_userId)
                     RequestSelectedVoiceChannel();
-            } catch (...) {}
+            } catch (...) {
+                QueueLog("HandleMessage: voice state parse error");
+            }
             return;
         }
 
@@ -443,7 +447,9 @@ void DiscordClient::HandleMessage(const std::string& message) {
                 for (const auto& vs : d["voice_states"]) {
                     try {
                         m_users.push_back(ParseVoiceUserFromJSON(vs));
-                    } catch (...) {}
+                    } catch (...) {
+                        QueueLog("HandleMessage: voice state parse error");
+                    }
                 }
             }
         }

@@ -80,6 +80,7 @@ public:
     std::vector<std::string> DrainLogQueue();
 
     // Set or clear the Discord Rich Presence activity.
+    // activityJson must be a complete Discord RPC envelope: {"cmd":"SET_ACTIVITY","nonce":"...","args":{...}}
     // Thread-safe: queues payload for the network thread to send.
     void SetActivity(const std::string& activityJson);
     void ClearActivity();
