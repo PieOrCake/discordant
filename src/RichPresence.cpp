@@ -3,7 +3,6 @@
 #include "MapData.h"
 #include <nlohmann/json.hpp>
 #include <windows.h>
-#include <string>
 
 using json = nlohmann::json;
 
@@ -21,7 +20,8 @@ void RichPresence::Update(const RPGameState& state, const RPConfig& cfg) {
         state.profession   != m_lastProfession ||
         cfg.showCharName   != m_lastShowName   ||
         cfg.showMap        != m_lastShowMap    ||
-        cfg.showProfession != m_lastShowProf;
+        cfg.showProfession != m_lastShowProf   ||
+        cfg.showPartySize  != m_lastShowParty;
 
     if (!changed) return;
 
@@ -33,6 +33,7 @@ void RichPresence::Update(const RPGameState& state, const RPConfig& cfg) {
     m_lastShowName   = cfg.showCharName;
     m_lastShowMap    = cfg.showMap;
     m_lastShowProf   = cfg.showProfession;
+    m_lastShowParty  = cfg.showPartySize;
 
     if (!cfg.enabled) {
         m_client->ClearActivity();
@@ -51,7 +52,7 @@ std::string RichPresence::BuildActivityJson(const RPGameState& state, const RPCo
     json activity;
 
     if (!state.inGame || (state.charName.empty() && state.mapId == 0)) {
-        // Char select or loading screen
+        // Not in game, or no data yet (char select, loading screen)
         activity["details"] = "Playing Guild Wars 2";
     } else {
         // Build details (top line) and state (bottom line)
@@ -78,7 +79,7 @@ std::string RichPresence::BuildActivityJson(const RPGameState& state, const RPCo
 
     json j;
     j["cmd"]           = "SET_ACTIVITY";
-    j["nonce"]         = "rp_set";
+    j["nonce"]         = "rp_" + std::to_string(++m_nonce);
     j["args"]["pid"]   = (int)GetCurrentProcessId();
     j["args"]["activity"] = activity;
     return j.dump();

@@ -47,4 +47,6 @@ private:
     bool        m_lastShowName   = false;
     bool        m_lastShowMap    = false;
     bool        m_lastShowProf   = false;
+    bool        m_lastShowParty  = false;
+    mutable unsigned m_nonce = 0;
 };
