@@ -91,6 +91,21 @@ std::vector<std::string> DiscordClient::DrainLogQueue() {
     return out;
 }
 
+void DiscordClient::SetActivity(const std::string& activityJson) {
+    std::lock_guard<std::mutex> lock(m_activityMutex);
+    m_pendingActivity = activityJson;
+    m_activityPending.store(true);
+}
+
+void DiscordClient::ClearActivity() {
+    nlohmann::json j;
+    j["cmd"]  = "SET_ACTIVITY";
+    j["nonce"] = "rp_clear";
+    j["args"]["pid"] = (int)GetCurrentProcessId();
+    j["args"]["activity"] = nullptr;
+    SetActivity(j.dump());
+}
+
 std::string DiscordClient::GetStatusText() const {
     switch (m_state.load()) {
     case DiscordState::Disconnected:    return "Disconnected";
@@ -202,6 +217,18 @@ void DiscordClient::NetworkThreadMain() {
             HandleMessage(msg);
         }
 
+        // Send queued Rich Presence activity update
+        if (m_activityPending.load() && m_state.load() == DiscordState::Connected) {
+            std::string act;
+            {
+                std::lock_guard<std::mutex> lock(m_activityMutex);
+                act = m_pendingActivity;
+                m_pendingActivity.clear();
+            }
+            m_activityPending.store(false);
+            m_ws.SendText(act);
+        }
+
         // Sleep briefly to avoid busy-spinning
         Sleep(16);
     }
@@ -249,18 +276,22 @@ void DiscordClient::HandleMessage(const std::string& message) {
         }
 
         if (evt == "VOICE_STATE_UPDATE") {
-            std::lock_guard<std::mutex> lock(m_userMutex);
-            VoiceUser u = ParseVoiceUserFromJSON(j["data"]);
-            UpdateUser(u.id, u);
+            try {
+                std::lock_guard<std::mutex> lock(m_userMutex);
+                VoiceUser u = ParseVoiceUserFromJSON(j["data"]);
+                UpdateUser(u.id, u);
+            } catch (...) {}
             return;
         }
 
         if (evt == "VOICE_STATE_CREATE") {
-            std::lock_guard<std::mutex> lock(m_userMutex);
-            VoiceUser u = ParseVoiceUserFromJSON(j["data"]);
-            UpdateUser(u.id, u);
-            if (u.id == m_userId)
-                RequestSelectedVoiceChannel();
+            try {
+                std::lock_guard<std::mutex> lock(m_userMutex);
+                VoiceUser u = ParseVoiceUserFromJSON(j["data"]);
+                UpdateUser(u.id, u);
+                if (u.id == m_userId)
+                    RequestSelectedVoiceChannel();
+            } catch (...) {}
             return;
         }
 
@@ -268,8 +299,10 @@ void DiscordClient::HandleMessage(const std::string& message) {
             std::lock_guard<std::mutex> lock(m_userMutex);
             std::string uid = j["data"]["user"].value("id", "");
             RemoveUser(uid);
-            if (uid == m_userId)
+            if (uid == m_userId) {
                 m_users.clear();
+                RequestSelectedVoiceChannel();
+            }
             return;
         }
 
@@ -408,7 +441,9 @@ void DiscordClient::HandleMessage(const std::string& message) {
 
             if (d.contains("voice_states") && d["voice_states"].is_array()) {
                 for (const auto& vs : d["voice_states"]) {
-                    m_users.push_back(ParseVoiceUserFromJSON(vs));
+                    try {
+                        m_users.push_back(ParseVoiceUserFromJSON(vs));
+                    } catch (...) {}
                 }
             }
         }
@@ -424,7 +459,7 @@ void DiscordClient::StartAuthorize() {
     m_state.store(DiscordState::Authorizing);
     json args;
     args["client_id"] = STREAMKIT_CLIENT_ID;
-    args["scopes"] = json::array({"rpc"});
+    args["scopes"] = json::array({"rpc", "rpc.activities.write"});
     args["prompt"] = "consent";
 
     json j;
