@@ -1,13 +1,13 @@
 #include "RichPresence.h"
-#include "DiscordClient.h"
+#include "DiscordIPC.h"
 #include "MapData.h"
 #include <nlohmann/json.hpp>
 #include <windows.h>
 
 using json = nlohmann::json;
 
-RichPresence::RichPresence(DiscordClient* client)
-    : m_client(client)
+RichPresence::RichPresence(DiscordIPC* ipc)
+    : m_ipc(ipc)
 {}
 
 void RichPresence::Update(const RPGameState& state, const RPConfig& cfg) {
@@ -36,16 +36,16 @@ void RichPresence::Update(const RPGameState& state, const RPConfig& cfg) {
     m_lastShowParty  = cfg.showPartySize;
 
     if (!cfg.enabled) {
-        m_client->ClearActivity();
+        m_ipc->ClearActivity();
         return;
     }
 
-    m_client->SetActivity(BuildActivityJson(state, cfg));
+    m_ipc->SetActivity(BuildActivityJson(state, cfg));
 }
 
 void RichPresence::Shutdown() {
     if (m_lastEnabled)
-        m_client->ClearActivity();
+        m_ipc->ClearActivity();
 }
 
 std::string RichPresence::BuildActivityJson(const RPGameState& state, const RPConfig& cfg) const {

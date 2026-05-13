@@ -2,7 +2,7 @@
 #include <string>
 #include <cstdint>
 
-class DiscordClient;
+class DiscordIPC;
 
 // Per-frame game state passed in from dllmain
 struct RPGameState {
@@ -23,7 +23,7 @@ struct RPConfig {
 
 class RichPresence {
 public:
-    explicit RichPresence(DiscordClient* client);
+    explicit RichPresence(DiscordIPC* ipc);
 
     // Call once per frame from AddonRender. Sends activity only when state changes.
     void Update(const RPGameState& state, const RPConfig& cfg);
@@ -36,7 +36,7 @@ private:
     static const char* ProfessionName(unsigned prof);
     static const char* ProfessionKey(unsigned prof);  // Discord asset key
 
-    DiscordClient* m_client;
+    DiscordIPC* m_ipc;
 
     // Cached state to detect changes
     bool        m_lastEnabled    = false;
