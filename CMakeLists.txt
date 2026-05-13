@@ -48,6 +48,7 @@ set(SOURCES
     src/DiscordClient.cpp
     src/WebSocket.cpp
     src/RichPresence.cpp
+    src/DiscordIPC.cpp
     ${IMGUI_SOURCES}
 )
 
