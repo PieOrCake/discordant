@@ -166,8 +166,7 @@ static void SaveConfig() {
         j["rp_show_map"]   = g_RPConfig.showMap;
         j["rp_show_prof"]  = g_RPConfig.showProfession;
         j["rp_show_party"] = g_RPConfig.showPartySize;
-        if (g_RPAppIdOverride[0] != '\0')
-            j["rp_app_id"] = std::string(g_RPAppIdOverride);
+        j["rp_app_id"] = std::string(g_RPAppIdOverride);
         auto saveCol = [](float* c) -> nlohmann::json { return {c[0], c[1], c[2], c[3]}; };
         j["col_speaking"] = saveCol(g_ColSpeaking);
         j["col_silent"] = saveCol(g_ColSilent);
