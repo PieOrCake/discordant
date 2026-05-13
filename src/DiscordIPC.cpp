@@ -7,6 +7,7 @@ using json = nlohmann::json;
 
 static constexpr uint32_t OP_HANDSHAKE = 0;
 static constexpr uint32_t OP_FRAME     = 1;
+static constexpr uint32_t OP_CLOSE     = 2;
 
 DiscordIPC::DiscordIPC() {}
 
@@ -163,7 +164,7 @@ void DiscordIPC::ThreadMain() {
         uint32_t op = 0;
         std::string payload;
         while (ReadFrame(op, payload)) {
-            if (op == 2) { // CLOSE
+            if (op == OP_CLOSE) {
                 Disconnect();
                 m_reconnectAt = GetTickCount64() + 5000;
                 break;
