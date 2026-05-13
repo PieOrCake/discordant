@@ -692,7 +692,7 @@ void AddonOptions() {
         if (ImGui::InputText("Application ID", g_RPAppIdOverride, sizeof(g_RPAppIdOverride)))
             SaveConfig();
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Leave blank to use the built-in application ID.");
+            ImGui::SetTooltip("Custom application ID support is reserved for a future update.");
 
         if (ImGui::Checkbox("Show character name", &g_RPConfig.showCharName)) SaveConfig();
         if (ImGui::Checkbox("Show current map",    &g_RPConfig.showMap))      SaveConfig();
