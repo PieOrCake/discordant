@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
 project(Discordant)
 
+# Load developer secrets (App IDs, etc.) — file is gitignored
+include(${CMAKE_SOURCE_DIR}/cmake/secrets.cmake OPTIONAL)
+if(NOT DEFINED DISCORD_APP_ID)
+    set(DISCORD_APP_ID "")
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -51,6 +57,10 @@ set(HEADERS
 
 # Create shared library (DLL)
 add_library(Discordant SHARED ${SOURCES} ${HEADERS})
+
+target_compile_definitions(Discordant PRIVATE
+    DISCORD_APP_ID="${DISCORD_APP_ID}"
+)
 
 # Force Windows DLL extension
 set_target_properties(Discordant PROPERTIES
