@@ -6,16 +6,18 @@
 #include <unordered_map>
 
 #include "nexus/Nexus.h"
+#include "mumble/Mumble.h"
 #include "imgui.h"
 #include <nlohmann/json.hpp>
 
 #include "DiscordClient.h"
+#include "RichPresence.h"
 
 // Version constants
 #define V_MAJOR 0
 #define V_MINOR 9
 #define V_BUILD 0
-#define V_REVISION 2
+#define V_REVISION 3
 
 // Quick Access identifiers
 #define QA_ID "QA_DISCORDANT"
@@ -63,8 +65,22 @@ bool g_GrowUpward = false;
 bool g_HideOnHover = false;
 DiscordClient* g_Discord = nullptr;
 
+// MumbleLink
+static Mumble::Data*     g_MumbleLink = nullptr;
+static Mumble::Identity  g_MumbleIdentity{};
+
+// Rich Presence
+static RichPresence* g_RichPresence = nullptr;
+static RPConfig      g_RPConfig{};
+static char          g_RPAppIdOverride[64] = {0};
+
 // Config file path (set during load)
 static char g_ConfigPath[MAX_PATH] = {0};
+
+static void OnMumbleIdentityUpdated(void* eventArgs) {
+    if (!eventArgs) return;
+    g_MumbleIdentity = *reinterpret_cast<const Mumble::Identity*>(eventArgs);
+}
 
 // Forward declarations
 void AddonLoad(AddonAPI_t* aApi);
@@ -113,6 +129,15 @@ static void LoadConfig() {
             if (j.contains("hide_on_hover")) {
                 g_HideOnHover = j["hide_on_hover"].get<bool>();
             }
+            if (j.contains("rp_enabled"))      g_RPConfig.enabled        = j["rp_enabled"].get<bool>();
+            if (j.contains("rp_show_name"))     g_RPConfig.showCharName   = j["rp_show_name"].get<bool>();
+            if (j.contains("rp_show_map"))      g_RPConfig.showMap        = j["rp_show_map"].get<bool>();
+            if (j.contains("rp_show_prof"))     g_RPConfig.showProfession = j["rp_show_prof"].get<bool>();
+            if (j.contains("rp_show_party"))    g_RPConfig.showPartySize  = j["rp_show_party"].get<bool>();
+            if (j.contains("rp_app_id")) {
+                std::string aid = j["rp_app_id"].get<std::string>();
+                strncpy(g_RPAppIdOverride, aid.c_str(), sizeof(g_RPAppIdOverride) - 1);
+            }
             loadCol("col_speaking", g_ColSpeaking);
             loadCol("col_silent", g_ColSilent);
             loadCol("col_muted", g_ColMuted);
@@ -136,6 +161,13 @@ static void SaveConfig() {
         j["overlay_scale"] = g_OverlayScale;
         j["grow_upward"] = g_GrowUpward;
         j["hide_on_hover"] = g_HideOnHover;
+        j["rp_enabled"]    = g_RPConfig.enabled;
+        j["rp_show_name"]  = g_RPConfig.showCharName;
+        j["rp_show_map"]   = g_RPConfig.showMap;
+        j["rp_show_prof"]  = g_RPConfig.showProfession;
+        j["rp_show_party"] = g_RPConfig.showPartySize;
+        if (g_RPAppIdOverride[0] != '\0')
+            j["rp_app_id"] = std::string(g_RPAppIdOverride);
         auto saveCol = [](float* c) -> nlohmann::json { return {c[0], c[1], c[2], c[3]}; };
         j["col_speaking"] = saveCol(g_ColSpeaking);
         j["col_silent"] = saveCol(g_ColSilent);
@@ -190,26 +222,24 @@ static Texture_t* GetCachedAvatarTexture(const VoiceUser& user) {
     auto it = s_avatarCache.find(key);
     if (it != s_avatarCache.end()) {
         if (it->second.tex && it->second.tex->Resource) return it->second.tex;
-        if (it->second.requested) return nullptr; // still loading
+        if (it->second.requested && it->second.tex) return nullptr; // pointer exists, Resource still loading
+        // tex is null — API returned nullptr while async load was in progress; retry to get pointer
     }
-    // First request or texture not yet ready — call API once
     std::string texId = "TEX_AVATAR_" + user.id;
     std::string endpoint = "/avatars/" + user.id + "/" + user.avatar + ".png?size=32";
     Texture_t* tex = APIDefs->Textures_GetOrCreateFromURL(texId.c_str(), "https://cdn.discordapp.com", endpoint.c_str());
-    AvatarCacheEntry entry;
+    AvatarCacheEntry& entry = s_avatarCache[key];
     entry.tex = tex;
     entry.requested = true;
-    s_avatarCache[key] = entry;
     return (tex && tex->Resource) ? tex : nullptr;
 }
 
 static Texture_t* GetCachedChannelIconTexture(const std::string& iconId) {
     if (iconId.empty()) return nullptr;
-    if (s_chanIconCacheKey == iconId && s_chanIconCache.tex && s_chanIconCache.tex->Resource) {
-        return s_chanIconCache.tex;
-    }
-    if (s_chanIconCacheKey == iconId && s_chanIconCache.requested) {
-        return nullptr; // still loading
+    if (s_chanIconCacheKey == iconId) {
+        if (s_chanIconCache.tex && s_chanIconCache.tex->Resource) return s_chanIconCache.tex;
+        if (s_chanIconCache.requested && s_chanIconCache.tex) return nullptr; // pointer exists, still loading
+        // tex is null — retry to get pointer
     }
     std::string texId = "TEX_CHANICON_" + iconId;
     std::string endpoint = "/emojis/" + iconId + ".png?size=32";
@@ -505,6 +535,9 @@ void AddonLoad(AddonAPI_t* aApi) {
 
     // Allocate Discord client on heap (not as global to avoid DllMain issues)
     g_Discord = new DiscordClient();
+    g_RichPresence = new RichPresence(g_Discord);
+    g_MumbleLink = (Mumble::Data*)APIDefs->DataLink_Get(DL_MUMBLE_LINK);
+    APIDefs->Events_Subscribe("EV_MUMBLE_IDENTITY_UPDATED", OnMumbleIdentityUpdated);
 
     // Set up config path
     std::string addonDir = APIDefs->Paths_GetAddonDirectory("Discordant");
@@ -537,6 +570,15 @@ void AddonLoad(AddonAPI_t* aApi) {
 void AddonUnload() {
     SaveConfig();
 
+    APIDefs->Events_Unsubscribe("EV_MUMBLE_IDENTITY_UPDATED", OnMumbleIdentityUpdated);
+    g_MumbleLink = nullptr;
+
+    if (g_RichPresence) {
+        g_RichPresence->Shutdown();
+        delete g_RichPresence;
+        g_RichPresence = nullptr;
+    }
+
     if (g_Discord) {
         g_Discord->Disconnect();
         delete g_Discord;
@@ -554,6 +596,16 @@ void AddonUnload() {
 
 void AddonRender() {
     if (!g_Discord) return;
+
+    if (g_RichPresence) {
+        RPGameState rpState;
+        rpState.inGame     = g_MumbleLink && g_MumbleLink->UITick > 0
+                             && g_MumbleIdentity.Name[0] != '\0';
+        rpState.charName   = g_MumbleIdentity.Name;
+        rpState.mapId      = g_MumbleIdentity.MapID;
+        rpState.profession = static_cast<unsigned>(g_MumbleIdentity.Profession);
+        g_RichPresence->Update(rpState, g_RPConfig);
+    }
 
     // Flush Discord log queue to Nexus log (throttled to every 30 frames)
     static int s_logFrameCount = 0;
@@ -627,6 +679,33 @@ void AddonOptions() {
     if (ImGui::ColorEdit4("Silent##col", g_ColSilent, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar)) SaveConfig();
     if (ImGui::ColorEdit4("Muted##col", g_ColMuted, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar)) SaveConfig();
     if (ImGui::ColorEdit4("Channel name##col", g_ColChannel, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar)) SaveConfig();
+
+    ImGui::Separator();
+    ImGui::Text("Rich Presence");
+    ImGui::Spacing();
+
+    if (ImGui::Checkbox("Enable Rich Presence", &g_RPConfig.enabled)) SaveConfig();
+
+    if (g_RPConfig.enabled) {
+        ImGui::Indent();
+
+        ImGui::SetNextItemWidth(200.0f);
+        if (ImGui::InputText("Application ID", g_RPAppIdOverride, sizeof(g_RPAppIdOverride)))
+            SaveConfig();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Leave blank to use the built-in application ID.");
+
+        if (ImGui::Checkbox("Show character name", &g_RPConfig.showCharName)) SaveConfig();
+        if (ImGui::Checkbox("Show current map",    &g_RPConfig.showMap))      SaveConfig();
+        if (ImGui::Checkbox("Show profession",     &g_RPConfig.showProfession)) SaveConfig();
+
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.5f);
+        ImGui::Checkbox("Show party size (not yet available)", &g_RPConfig.showPartySize);
+        ImGui::PopStyleVar();
+
+        ImGui::Unindent();
+    }
+
     ImGui::Spacing();
     ImGui::Text("The voice overlay appears automatically when in a Discord voice channel.");
 
