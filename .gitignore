@@ -21,3 +21,8 @@ Thumbs.db
 
 # Secrets
 cmake/secrets.cmake
+
+# LLM files
+CLAUDE.md
+handover.md
+docs/handover.md
