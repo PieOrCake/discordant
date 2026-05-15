@@ -9,6 +9,18 @@ static constexpr uint32_t OP_HANDSHAKE = 0;
 static constexpr uint32_t OP_FRAME     = 1;
 static constexpr uint32_t OP_CLOSE     = 2;
 
+void DiscordIPC::QueueLog(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(m_logMutex);
+    m_logQueue.push_back(msg);
+}
+
+std::vector<std::string> DiscordIPC::DrainLogQueue() {
+    std::lock_guard<std::mutex> lock(m_logMutex);
+    std::vector<std::string> out;
+    out.swap(m_logQueue);
+    return out;
+}
+
 DiscordIPC::DiscordIPC() {}
 
 DiscordIPC::~DiscordIPC() {
@@ -93,46 +105,42 @@ bool DiscordIPC::Connect() {
         std::lock_guard<std::mutex> lock(m_appIdMutex);
         appId = m_appId;
     }
-    if (appId.empty()) return false;
+    if (appId.empty()) {
+        QueueLog("IPC: Connect() called with empty appId, skipping");
+        return false;
+    }
+
+    QueueLog("IPC: scanning discord-ipc-0..9 (appId=" + appId + ")");
 
     wchar_t pipeName[] = L"\\\\.\\pipe\\discord-ipc-0";
     const size_t digitIdx = (sizeof(pipeName) / sizeof(wchar_t)) - 2;
+    int foundPipe = -1;
     for (int i = 0; i < 10 && m_running.load(); ++i) {
         pipeName[digitIdx] = L'0' + i;
         m_pipe = CreateFileW(pipeName, GENERIC_READ | GENERIC_WRITE,
                              0, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (m_pipe != INVALID_HANDLE_VALUE) break;
+        if (m_pipe != INVALID_HANDLE_VALUE) { foundPipe = i; break; }
     }
-    if (m_pipe == INVALID_HANDLE_VALUE) return false;
+    if (m_pipe == INVALID_HANDLE_VALUE) {
+        QueueLog("IPC: no discord-ipc pipe found (GetLastError=" + std::to_string(GetLastError()) + ")");
+        return false;
+    }
+    QueueLog("IPC: opened discord-ipc-" + std::to_string(foundPipe));
 
     json hs;
     hs["v"]         = 1;
     hs["client_id"] = appId;
     if (!SendFrame(OP_HANDSHAKE, hs.dump())) {
+        QueueLog("IPC: handshake write failed (GetLastError=" + std::to_string(GetLastError()) + ")");
         Disconnect();
         return false;
     }
-
-    Sleep(200);
-    uint32_t op = 0;
-    std::string resp;
-    if (!ReadFrame(op, resp)) {
-        return true; // optimistically continue; READY may come later
-    }
-    try {
-        auto rj = json::parse(resp);
-        if (rj.value("evt", "") != "READY") {
-            Disconnect();
-            return false;
-        }
-    } catch (...) {
-        Disconnect();
-        return false;
-    }
+    QueueLog("IPC: handshake sent, waiting for READY");
     return true;
 }
 
 void DiscordIPC::Disconnect() {
+    m_ready.store(false);
     if (m_pipe != INVALID_HANDLE_VALUE) {
         CloseHandle(m_pipe);
         m_pipe = INVALID_HANDLE_VALUE;
@@ -140,9 +148,12 @@ void DiscordIPC::Disconnect() {
 }
 
 void DiscordIPC::ThreadMain() {
+    QueueLog("IPC: thread started");
     while (m_running.load()) {
         if (m_reconnect.load()) {
+            QueueLog("IPC: reconnect triggered (appId changed)");
             m_reconnect.store(false);
+            m_ready.store(false);
             Disconnect();
             m_reconnectAt = 0;
         }
@@ -154,6 +165,8 @@ void DiscordIPC::ThreadMain() {
                 continue;
             }
             if (!Connect()) {
+                QueueLog("IPC: connect failed, retrying in 10s");
+                m_ready.store(false);
                 m_reconnectAt = GetTickCount64() + 10000;
                 Sleep(500);
                 continue;
@@ -165,9 +178,25 @@ void DiscordIPC::ThreadMain() {
         std::string payload;
         while (ReadFrame(op, payload)) {
             if (op == OP_CLOSE) {
+                QueueLog("IPC: OP_CLOSE received from Discord, reconnecting in 5s");
+                m_ready.store(false);
                 Disconnect();
                 m_reconnectAt = GetTickCount64() + 5000;
                 break;
+            }
+            if (!m_ready.load() && op == OP_FRAME) {
+                try {
+                    auto rj = json::parse(payload);
+                    std::string evt = rj.value("evt", "");
+                    if (evt == "READY") {
+                        QueueLog("IPC: READY received — connection established");
+                        m_ready.store(true);
+                    } else {
+                        QueueLog("IPC: unexpected frame before READY: evt='" + evt + "'");
+                    }
+                } catch (...) {
+                    QueueLog("IPC: failed to parse pre-READY frame");
+                }
             }
         }
 
@@ -175,13 +204,15 @@ void DiscordIPC::ThreadMain() {
         if (m_pipe != INVALID_HANDLE_VALUE) {
             DWORD flags = 0;
             if (!GetNamedPipeHandleStateA(m_pipe, &flags, nullptr, nullptr, nullptr, nullptr, 0)) {
+                QueueLog("IPC: pipe health check failed (GetLastError=" + std::to_string(GetLastError()) + "), reconnecting in 5s");
+                m_ready.store(false);
                 Disconnect();
                 m_reconnectAt = GetTickCount64() + 5000;
             }
         }
 
-        // Send pending activity
-        if (m_activityPending.load() && m_pipe != INVALID_HANDLE_VALUE) {
+        // Send pending activity (only after READY)
+        if (m_activityPending.load() && m_ready.load() && m_pipe != INVALID_HANDLE_VALUE) {
             std::string act;
             {
                 std::lock_guard<std::mutex> lock(m_activityMutex);
@@ -189,7 +220,9 @@ void DiscordIPC::ThreadMain() {
                 m_pendingActivity.clear();
                 m_activityPending.store(false);
             }
+            QueueLog("IPC: sending activity frame");
             if (!SendFrame(OP_FRAME, act)) {
+                QueueLog("IPC: activity frame send failed (GetLastError=" + std::to_string(GetLastError()) + "), reconnecting in 5s");
                 Disconnect();
                 m_reconnectAt = GetTickCount64() + 5000;
             }
@@ -198,5 +231,6 @@ void DiscordIPC::ThreadMain() {
         Sleep(16);
     }
 
+    QueueLog("IPC: thread stopped");
     Disconnect();
 }

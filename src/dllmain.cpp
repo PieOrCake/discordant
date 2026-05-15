@@ -17,8 +17,8 @@
 // Version constants
 #define V_MAJOR 0
 #define V_MINOR 9
-#define V_BUILD 0
-#define V_REVISION 3
+#define V_BUILD 2
+#define V_REVISION 0
 
 // Quick Access identifiers
 #define QA_ID "QA_DISCORDANT"
@@ -141,7 +141,6 @@ static void LoadConfig() {
             if (j.contains("rp_show_name"))     g_RPConfig.showCharName   = j["rp_show_name"].get<bool>();
             if (j.contains("rp_show_map"))      g_RPConfig.showMap        = j["rp_show_map"].get<bool>();
             if (j.contains("rp_show_prof"))     g_RPConfig.showProfession = j["rp_show_prof"].get<bool>();
-            if (j.contains("rp_show_party"))    g_RPConfig.showPartySize  = j["rp_show_party"].get<bool>();
             if (j.contains("rp_app_id")) {
                 std::string aid = j["rp_app_id"].get<std::string>();
                 strncpy(g_RPAppIdOverride, aid.c_str(), sizeof(g_RPAppIdOverride) - 1);
@@ -173,7 +172,6 @@ static void SaveConfig() {
         j["rp_show_name"]  = g_RPConfig.showCharName;
         j["rp_show_map"]   = g_RPConfig.showMap;
         j["rp_show_prof"]  = g_RPConfig.showProfession;
-        j["rp_show_party"] = g_RPConfig.showPartySize;
         j["rp_app_id"] = std::string(g_RPAppIdOverride);
         if (g_DiscordIPC)
             g_DiscordIPC->SetAppId(GetEffectiveAppId());
@@ -618,21 +616,26 @@ void AddonRender() {
         RPGameState rpState;
         rpState.inGame     = g_MumbleLink && g_MumbleLink->UITick > 0
                              && g_MumbleIdentity.Name[0] != '\0';
-        rpState.charName   = g_MumbleIdentity.Name;
-        rpState.mapId      = g_MumbleIdentity.MapID;
-        rpState.profession = static_cast<unsigned>(g_MumbleIdentity.Profession);
+        rpState.charName        = g_MumbleIdentity.Name;
+        rpState.mapId           = g_MumbleIdentity.MapID;
+        rpState.profession      = static_cast<unsigned>(g_MumbleIdentity.Profession);
+        rpState.specialization  = g_MumbleIdentity.Specialization;
         g_RichPresence->Update(rpState, g_RPConfig);
     }
 
-    // Flush Discord log queue to Nexus log (throttled to every 30 frames)
+    // Flush log queues to Nexus log (throttled to every 30 frames)
     static int s_logFrameCount = 0;
     if (++s_logFrameCount >= 30) {
         s_logFrameCount = 0;
-        auto logs = g_Discord->DrainLogQueue();
-        if (!logs.empty()) {
-            for (const auto& msg : logs) {
-                APIDefs->Log(LOGL_INFO, "Discordant", msg.c_str());
-            }
+        for (const auto& msg : g_Discord->DrainLogQueue())
+            APIDefs->Log(LOGL_INFO, "Discordant", msg.c_str());
+        if (g_DiscordIPC) {
+            for (const auto& msg : g_DiscordIPC->DrainLogQueue())
+                APIDefs->Log(LOGL_INFO, "Discordant/IPC", msg.c_str());
+        }
+        if (g_RichPresence) {
+            for (const auto& msg : g_RichPresence->DrainLogQueue())
+                APIDefs->Log(LOGL_INFO, "Discordant/RP", msg.c_str());
         }
     }
 
@@ -717,7 +720,6 @@ void AddonOptions() {
         if (ImGui::Checkbox("Show profession",     &g_RPConfig.showProfession)) SaveConfig();
 
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.5f);
-        ImGui::Checkbox("Show party size (not yet available)", &g_RPConfig.showPartySize);
         ImGui::PopStyleVar();
 
         ImGui::Unindent();

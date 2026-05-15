@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -27,7 +28,11 @@ public:
     // Queue a presence clear. Thread-safe.
     void ClearActivity();
 
+    // Drain log messages — call from render thread every N frames.
+    std::vector<std::string> DrainLogQueue();
+
 private:
+    void QueueLog(const std::string& msg);
     void ThreadMain();
     bool Connect();
     void Disconnect();
@@ -38,6 +43,7 @@ private:
     std::string         m_appId;
     std::mutex          m_appIdMutex;
     std::atomic<bool>   m_reconnect{false};
+    std::atomic<bool>   m_ready{false};
 
     std::thread         m_thread;
     std::atomic<bool>   m_running{false};
@@ -47,4 +53,7 @@ private:
     std::atomic<bool>   m_activityPending{false};
 
     uint64_t            m_reconnectAt = 0;
+
+    std::mutex              m_logMutex;
+    std::vector<std::string> m_logQueue;
 };

@@ -2,13 +2,13 @@
 
 Discord voice channel overlay for Guild Wars 2, built as a [Nexus](https://raidcore.gg/gw2/nexus) addon.
 
-Shows who is in your current Discord voice channel, who is muted/deafened, and who is currently speaking — all rendered in-game via ImGui.
+Shows who is in your current Discord voice channel, who is muted/deafened, and who is currently speaking — all rendered in-game via ImGui. Also displays your GW2 character, map, and elite specialization on your Discord profile via Rich Presence.
 
 ![Overlay screenshot](images/overlay.png)
 
 ## AI Notice
 
-This addon has been 100% created in [Windsurf](https://windsurf.com/) using Claude. I understand that some folks have a moral, financial or political objection to creating software using an LLM. I just wanted to make a useful tool for the GW2 community, and this was the only way I could do it.
+This addon has been 100% created largely using Claude. I understand that some folks have a moral, financial or political objection to creating software using an LLM. I just wanted to make a useful tool for the GW2 community, and this was the only way I could do it.
 
 If an LLM creating software upsets you, then perhaps this repo isn't for you. Move on, and enjoy your day.
 
@@ -18,7 +18,7 @@ Discordant connects to the locally running Discord desktop client via its WebSoc
 
 On first use, Discord will show a one-time authorization prompt. After that, the token is cached and reused automatically.
 
-### Features
+### Voice Overlay
 
 - **User list** — see everyone in your current voice channel
 - **Speaking indicator** — green dot when someone is talking
@@ -26,13 +26,25 @@ On first use, Discord will show a one-time authorization prompt. After that, the
 - **Auto-follow** — automatically tracks when you switch voice channels
 - **Lightweight** — no external processes, no bot, just a single DLL
 
+### Rich Presence
+
+Shows your GW2 status on your Discord profile:
+
+- **Character name** — displayed as the activity title
+- **Current map** — shown as the activity subtitle
+- **Elite specialization** — shown as the large image (falls back to base profession for core builds)
+- All fields are individually toggleable in the Nexus options panel
+- Custom Discord Application ID supported if you want to use your own app
+
 ### Linux Compatibility
 
 GW2 on Linux runs under Wine/Proton. The addon DLL loads inside Wine, but Discord runs natively on the host. This works because:
 
 - The WebSocket connection uses TCP on `127.0.0.1`, which Wine's Winsock correctly forwards to the host network stack
-- No Unix socket or named pipe discovery needed
+- No Unix socket or named pipe discovery needed for the voice overlay
 - Works with Discord installed natively or as a Flatpak
+
+**Rich Presence on Linux** requires [wine-discord-ipc-bridge](https://github.com/EnderIce2/wine-discord-ipc-bridge) running in the same wineprefix as GW2. It bridges Wine's named pipe namespace to Discord's native socket. Flatpak's sandbox prevents this feature from working.
 
 ## Building
 
@@ -81,14 +93,15 @@ discordant/
 ├── CMakeLists.txt          # Build configuration
 ├── Discordant.def          # DLL export definition
 ├── include/
-│   └── nexus/
-│       └── Nexus.h         # Raidcore Nexus API header
+│   ├── nexus/Nexus.h       # Raidcore Nexus API header
+│   └── mumble/Mumble.h     # MumbleLink structs
 ├── src/
 │   ├── dllmain.cpp         # Addon entry point, ImGui overlay, Nexus integration
-│   ├── DiscordClient.h     # Discord RPC client interface
-│   ├── DiscordClient.cpp   # Discord RPC auth flow, voice event handling
-│   ├── WebSocket.h         # Minimal WebSocket client (Winsock2)
-│   └── WebSocket.cpp       # WebSocket implementation
+│   ├── DiscordClient.h/cpp # Discord RPC auth flow, voice event handling
+│   ├── WebSocket.h/cpp     # Minimal WebSocket client (Winsock2)
+│   ├── DiscordIPC.h/cpp    # Named pipe IPC client for Rich Presence
+│   ├── RichPresence.h/cpp  # MumbleLink → Discord activity updates
+│   └── MapData.h           # GW2 map ID → name lookup table
 ├── scripts/
 │   └── setup.sh            # Dependency download script
 └── README.md
