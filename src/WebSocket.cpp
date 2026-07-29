@@ -34,6 +34,7 @@ static void EnsureWSAStartup() {
 WebSocket::WebSocket()
     : m_socket(INVALID_SOCKET)
     , m_state(State::Disconnected)
+    , m_lastErrorRefused(false)
 {
     // WSAStartup deferred to Connect() to avoid calling it during DllMain
 }
@@ -51,13 +52,27 @@ std::string WebSocket::GenerateKey() {
     return Base64Encode(bytes, 16);
 }
 
+bool WebSocket::Fail(const std::string& reason, bool refused) {
+    m_lastError = reason;
+    m_lastErrorRefused = refused;
+    if (m_socket != INVALID_SOCKET) {
+        closesocket(m_socket);
+        m_socket = INVALID_SOCKET;
+    }
+    m_state = State::Disconnected;
+    return false;
+}
+
 bool WebSocket::Connect(const std::string& host, int port, const std::string& path,
                         const std::string& origin) {
     EnsureWSAStartup();
     Close();
+    m_lastError.clear();
+    m_lastErrorRefused = false;
 
     m_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (m_socket == INVALID_SOCKET) return false;
+    if (m_socket == INVALID_SOCKET)
+        return Fail("socket() failed, WSA error " + std::to_string(WSAGetLastError()), false);
 
     // Set non-blocking BEFORE connect to avoid blocking the render thread
     u_long nbMode = 1;
@@ -73,9 +88,8 @@ bool WebSocket::Connect(const std::string& host, int port, const std::string& pa
     if (ret == SOCKET_ERROR) {
         int err = WSAGetLastError();
         if (err != WSAEWOULDBLOCK) {
-            closesocket(m_socket);
-            m_socket = INVALID_SOCKET;
-            return false;
+            return Fail("connect() failed immediately, WSA error " + std::to_string(err),
+                        err == WSAECONNREFUSED);
         }
         // Connection in progress — use select() with a short timeout
         fd_set writefds, exceptfds;
@@ -88,10 +102,16 @@ bool WebSocket::Connect(const std::string& host, int port, const std::string& pa
         tv.tv_usec = 50000; // 50ms timeout
 
         ret = select(0, NULL, &writefds, &exceptfds, &tv);
-        if (ret <= 0 || FD_ISSET(m_socket, &exceptfds)) {
-            closesocket(m_socket);
-            m_socket = INVALID_SOCKET;
-            return false;
+        if (ret == 0)
+            return Fail("connect() timed out after 50ms (nothing listening, or blocked)", true);
+        if (ret < 0)
+            return Fail("select() failed, WSA error " + std::to_string(WSAGetLastError()), false);
+        if (FD_ISSET(m_socket, &exceptfds)) {
+            int optval = 0;
+            int optlen = sizeof(optval);
+            getsockopt(m_socket, SOL_SOCKET, SO_ERROR, (char*)&optval, &optlen);
+            return Fail("connect() refused, SO_ERROR " + std::to_string(optval),
+                        optval == WSAECONNREFUSED);
         }
 
         // Verify connection actually succeeded
@@ -99,9 +119,8 @@ bool WebSocket::Connect(const std::string& host, int port, const std::string& pa
         int optlen = sizeof(optval);
         getsockopt(m_socket, SOL_SOCKET, SO_ERROR, (char*)&optval, &optlen);
         if (optval != 0) {
-            closesocket(m_socket);
-            m_socket = INVALID_SOCKET;
-            return false;
+            return Fail("connect() failed, SO_ERROR " + std::to_string(optval),
+                        optval == WSAECONNREFUSED);
         }
     }
 
@@ -131,8 +150,7 @@ bool WebSocket::Connect(const std::string& host, int port, const std::string& pa
 
     std::string reqStr = req.str();
     if (!SendRaw(reqStr.c_str(), (int)reqStr.size())) {
-        Close();
-        return false;
+        return Fail("handshake send failed, WSA error " + std::to_string(WSAGetLastError()), false);
     }
 
     // Read HTTP response
@@ -141,16 +159,29 @@ bool WebSocket::Connect(const std::string& host, int port, const std::string& pa
     bool headersDone = false;
     while (!headersDone && total < (int)sizeof(buf) - 1) {
         int n = recv(m_socket, buf + total, (int)sizeof(buf) - 1 - total, 0);
-        if (n <= 0) { Close(); return false; }
+        if (n == 0)
+            return Fail("server closed the connection during handshake", false);
+        if (n < 0) {
+            int err = WSAGetLastError();
+            return Fail(err == WSAETIMEDOUT
+                            ? "handshake timed out after 500ms with no reply"
+                            : "handshake recv failed, WSA error " + std::to_string(err),
+                        false);
+        }
         total += n;
         buf[total] = '\0';
         if (strstr(buf, "\r\n\r\n")) headersDone = true;
     }
 
-    // Verify we got a 101 Switching Protocols
+    // Verify we got a 101 Switching Protocols. If not, the status line is the
+    // single most useful thing we can report — Discord rejects bad Origin or
+    // client_id with a 4xx here.
     if (!strstr(buf, "101")) {
-        Close();
-        return false;
+        std::string statusLine(buf, buf + total);
+        size_t eol = statusLine.find("\r\n");
+        if (eol != std::string::npos) statusLine.resize(eol);
+        if (statusLine.size() > 120) statusLine.resize(120);
+        return Fail("handshake rejected: " + statusLine, false);
     }
 
     // Any data after the headers is the start of WebSocket frames

@@ -133,6 +133,11 @@ private:
     uint64_t m_reconnectAt = 0;  // GetTickCount64() value
     int m_currentPort;           // port being tried
 
+    // Diagnostics: when we entered WaitingForReady, so a Discord client that
+    // accepts the socket but never sends READY doesn't just sit there silently.
+    uint64_t m_waitingForReadyAt = 0;
+    bool m_readyTimeoutLogged = false;
+
     // Voice user list
     std::mutex m_userMutex;
     std::vector<VoiceUser> m_users;  // maintained in channel join order

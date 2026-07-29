@@ -1,6 +1,6 @@
-# Discordant 0.9.2.1
+# Discordant 0.9.3.0
 
-Crash fix release. If 0.9.2.0 crashed your game on startup, this is the one to install.
+Stability release. If 0.9.2.0 crashed your game on startup, this is the one to install.
 
 ## Fixed
 
@@ -12,6 +12,14 @@ Crash fix release. If 0.9.2.0 crashed your game on startup, this is the one to i
 - **Unload safety.** Disabling or reloading the addon from Nexus no longer risks using memory that has already been freed.
 
 If Discordant runs into trouble now, it disconnects and writes to the Nexus log rather than closing the game.
+
+## Improved
+
+- **Connection problems are now explained in the log.** If Discordant can't reach Discord, the Nexus log says why — whether the Discord client isn't listening at all, whether it refused the connection, whether it accepted but never replied, or whether it quietly reused a saved login instead of prompting you. Previously all of these looked identical: nothing happened and nothing was logged.
+- Discord's own error messages are now passed through to the log rather than discarded.
+- Two cases where the addon could sit in "Authorizing" or "Authenticating" forever without saying anything now report the problem.
+
+If Discordant won't connect for you, the log at `addons/Nexus/Nexus.log` (lines tagged `Discordant`) should now say why. Note that if Discord has been running for a long time, restarting it — or your PC — resolves most connection failures.
 
 ## Notes
 

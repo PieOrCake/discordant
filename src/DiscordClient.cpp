@@ -105,7 +105,8 @@ std::string DiscordClient::GetStatusText() const {
 }
 
 void DiscordClient::NetworkThreadMain() {
-    QueueLog("Network thread started");
+    QueueLog(std::string("Network thread started; cached access token: ")
+             + (m_accessToken.empty() ? "none" : "present"));
     try {
         NetworkLoop();
     } catch (...) {
@@ -162,18 +163,34 @@ void DiscordClient::NetworkLoop() {
         } // fallthrough
         case DiscordState::Connecting: {
             // Try each port (blocking connect is fine on background thread)
+            int refusedCount = 0;
             while (m_currentPort <= RPC_PORT_MAX && m_running.load()) {
                 std::string path = "/?v=1&client_id=";
                 path += STREAMKIT_CLIENT_ID;
                 if (m_ws.Connect("127.0.0.1", m_currentPort, path, "http://localhost:3000")) {
-                    QueueLog("WebSocket connected on port " + std::to_string(m_currentPort));
+                    QueueLog("WebSocket connected on port " + std::to_string(m_currentPort)
+                             + ", waiting for Discord READY");
+                    m_waitingForReadyAt = GetTickCount64();
+                    m_readyTimeoutLogged = false;
                     m_state.store(DiscordState::WaitingForReady);
                     break;
+                }
+                // A refused port just means Discord isn't on it — expected, and
+                // noisy to log ten times. Anything else means something answered
+                // and turned us away, which is always worth a line.
+                if (m_ws.LastErrorWasRefused()) {
+                    refusedCount++;
+                } else {
+                    QueueLog("Port " + std::to_string(m_currentPort) + ": " + m_ws.GetLastError());
                 }
                 m_currentPort++;
             }
             if (m_state.load() != DiscordState::WaitingForReady) {
                 // All ports failed — schedule reconnect
+                QueueLog("No Discord RPC server found on ports "
+                         + std::to_string(RPC_PORT_MIN) + "-" + std::to_string(RPC_PORT_MAX)
+                         + " (" + std::to_string(refusedCount) + " refused/silent). "
+                         "Is the Discord desktop client running? Retrying in 10s.");
                 m_state.store(DiscordState::Disconnected);
                 m_reconnectAt = GetTickCount64() + 10000;
             }
@@ -181,6 +198,13 @@ void DiscordClient::NetworkLoop() {
             continue;
         }
         case DiscordState::WaitingForReady:
+            if (!m_readyTimeoutLogged && m_waitingForReadyAt > 0
+                && GetTickCount64() - m_waitingForReadyAt > 10000) {
+                m_readyTimeoutLogged = true;
+                QueueLog("Socket is open but Discord has not sent READY after 10s. "
+                         "The RPC handshake was accepted but the client is not responding.");
+            }
+            break;
         case DiscordState::Authorizing:
         case DiscordState::Authenticating:
         case DiscordState::Connected:
@@ -192,6 +216,8 @@ void DiscordClient::NetworkLoop() {
 
         // If WebSocket disconnected unexpectedly, schedule reconnect
         if (m_ws.GetState() != WebSocket::State::Connected) {
+            QueueLog("WebSocket dropped while in state '" + GetStatusText()
+                     + "'. Reconnecting in 10s.");
             m_state.store(DiscordState::Disconnected);
             m_reconnectAt = GetTickCount64() + 10000;
             m_currentVoice.clear();
@@ -271,13 +297,32 @@ void DiscordClient::HandleMessageImpl(const std::string& message) {
     // so every handler below must tolerate it being missing.
     const json* data = ObjectMember(j, "data");
 
+    // Any error frame is worth reporting verbatim — Discord's code/message pair
+    // says exactly why it turned us away (bad scope, rate limit, expired token).
+    if (evt == "ERROR") {
+        std::string detail;
+        if (data) {
+            detail = "code " + std::to_string(data->value("code", 0))
+                   + ": " + StringMember(*data, "message");
+        } else {
+            detail = "no detail supplied";
+        }
+        QueueLog("Discord returned an error for '" + (cmd.empty() ? "(no cmd)" : cmd)
+                 + "' — " + detail);
+    }
+
     // --- DISPATCH events ---
     if (cmd == "DISPATCH") {
         if (evt == "READY") {
             // Connection established, start auth
             if (!m_accessToken.empty()) {
+                QueueLog("READY received. A cached access token exists ("
+                         + std::to_string(m_accessToken.size())
+                         + " chars), authenticating with it — no Discord prompt will appear.");
                 Authenticate();
             } else {
+                QueueLog("READY received. No cached token, requesting authorization "
+                         "— Discord should now show a StreamKit prompt.");
                 StartAuthorize();
             }
             return;
@@ -379,9 +424,12 @@ void DiscordClient::HandleMessageImpl(const std::string& message) {
     if (cmd == "AUTHORIZE") {
         std::string code = data ? StringMember(*data, "code") : std::string();
         if (!code.empty()) {
+            QueueLog("AUTHORIZE approved, exchanging code for a token");
             ExchangeToken(code);
         } else {
             // Authorization denied
+            QueueLog("AUTHORIZE returned no code — the prompt was denied, dismissed, "
+                     "or never shown. Retrying in 60s.");
             m_state.store(DiscordState::Disconnected);
             m_reconnectAt = GetTickCount64() + 60000;
         }
@@ -391,6 +439,7 @@ void DiscordClient::HandleMessageImpl(const std::string& message) {
     if (cmd == "AUTHENTICATE") {
         if (evt == "ERROR") {
             // Token expired or invalid, re-authorize
+            QueueLog("Cached token was rejected, discarding it and re-authorizing");
             m_accessToken.clear();
             StartAuthorize();
             return;
@@ -398,9 +447,12 @@ void DiscordClient::HandleMessageImpl(const std::string& message) {
         if (data) {
             if (const json* user = ObjectMember(*data, "user"))
                 m_userId = StringMember(*user, "id");
+            QueueLog("Authenticated as user id " + (m_userId.empty() ? "(unknown)" : m_userId));
             m_state.store(DiscordState::Connected);
             SubscribeGlobalEvents();
             RequestSelectedVoiceChannel();
+        } else {
+            QueueLog("AUTHENTICATE reply had no data payload — stuck in Authenticating.");
         }
         return;
     }
@@ -472,7 +524,8 @@ void DiscordClient::StartAuthorize() {
     j["cmd"] = "AUTHORIZE";
     j["args"] = args;
     j["nonce"] = "discordant_auth";
-    m_ws.SendText(j.dump());
+    if (!m_ws.SendText(j.dump()))
+        QueueLog("Failed to send AUTHORIZE — the socket died before the prompt could be raised");
 }
 
 void DiscordClient::ExchangeToken(const std::string& code) {

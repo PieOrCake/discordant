@@ -17,8 +17,8 @@
 // Version constants
 #define V_MAJOR 0
 #define V_MINOR 9
-#define V_BUILD 2
-#define V_REVISION 1
+#define V_BUILD 3
+#define V_REVISION 0
 
 // Global variables — all POD/trivial to avoid DllMain issues
 HMODULE hSelf;
@@ -725,8 +725,8 @@ extern "C" __declspec(dllexport) AddonDefinition_t* GetAddonDef() {
     AddonDef.Load = AddonLoad;
     AddonDef.Unload = AddonUnload;
     AddonDef.Flags = AF_None;
-    AddonDef.Provider = UP_None;
-    AddonDef.UpdateLink = nullptr;
+    AddonDef.Provider = UP_GitHub;
+    AddonDef.UpdateLink = "https://github.com/PieOrCake/discordant";
 
     return &AddonDef;
 }
