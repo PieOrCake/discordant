@@ -80,18 +80,36 @@ bool DiscordIPC::SendFrame(uint32_t opcode, const std::string& payload) {
     return true;
 }
 
+// Discord's largest RPC frames are a few KB; anything beyond this means the
+// stream has desynced and the length is garbage.
+static constexpr uint32_t MAX_FRAME_PAYLOAD = 1u * 1024 * 1024;
+
 bool DiscordIPC::ReadFrame(uint32_t& opcode, std::string& payload) {
     if (m_pipe == INVALID_HANDLE_VALUE) return false;
-    DWORD available = 0;
-    if (!PeekNamedPipe(m_pipe, nullptr, 0, nullptr, &available, nullptr) || available < 8)
-        return false;
+
+    // Peek the header without consuming it, so we only commit to a blocking
+    // read once the entire frame has actually arrived.
     uint32_t header[2] = {0, 0};
+    DWORD peeked = 0, available = 0;
+    if (!PeekNamedPipe(m_pipe, header, sizeof(header), &peeked, &available, nullptr))
+        return false;
+    if (peeked < sizeof(header)) return false;
+
+    opcode = header[0];
+    uint32_t len = header[1];
+
+    if (len > MAX_FRAME_PAYLOAD) {
+        QueueLog("IPC: frame length " + std::to_string(len) + " out of range, dropping connection");
+        Disconnect();
+        m_reconnectAt = GetTickCount64() + 5000;
+        return false;
+    }
+    if (available < sizeof(header) + len) return false;  // frame still in flight
+
     DWORD read = 0;
     if (!ReadFile(m_pipe, header, sizeof(header), &read, nullptr) || read != sizeof(header))
         return false;
-    opcode = header[0];
-    uint32_t len = header[1];
-    payload.resize(len);
+    payload.assign(len, '\0');
     if (len > 0) {
         if (!ReadFile(m_pipe, payload.data(), len, &read, nullptr) || read != len)
             return false;
@@ -149,6 +167,17 @@ void DiscordIPC::Disconnect() {
 
 void DiscordIPC::ThreadMain() {
     QueueLog("IPC: thread started");
+    try {
+        ThreadLoop();
+    } catch (...) {
+        // Never let an exception escape a thread — that kills the game
+        QueueLog("IPC: thread aborted after an unhandled error");
+    }
+    QueueLog("IPC: thread stopped");
+    Disconnect();
+}
+
+void DiscordIPC::ThreadLoop() {
     while (m_running.load()) {
         if (m_reconnect.load()) {
             QueueLog("IPC: reconnect triggered (appId changed)");
@@ -230,7 +259,4 @@ void DiscordIPC::ThreadMain() {
 
         Sleep(16);
     }
-
-    QueueLog("IPC: thread stopped");
-    Disconnect();
 }

@@ -18,36 +18,7 @@
 #define V_MAJOR 0
 #define V_MINOR 9
 #define V_BUILD 2
-#define V_REVISION 0
-
-// Quick Access identifiers
-#define QA_ID "QA_DISCORDANT"
-#define TEX_ICON "TEX_DISCORDANT_ICON"
-#define TEX_ICON_HOVER "TEX_DISCORDANT_ICON_HOVER"
-
-// Valid 32x32 solid RGBA PNG (normal - gray)
-static const unsigned char ICON_HEADPHONES[] = {
-    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
-    0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x08, 0x06, 0x00, 0x00, 0x00, 0x73, 0x7a, 0x7a,
-    0xf4, 0x00, 0x00, 0x00, 0x34, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0xed, 0xd7, 0x31, 0x11, 0x00,
-    0x00, 0x08, 0x03, 0xb1, 0xfa, 0xbf, 0x8a, 0xc0, 0x29, 0xc8, 0x60, 0xc9, 0xd0, 0xfd, 0x2f, 0x5b,
-    0xd3, 0xce, 0x7e, 0x2e, 0x02, 0x08, 0x10, 0x20, 0x40, 0x80, 0x00, 0x01, 0x02, 0x04, 0x08, 0x10,
-    0x20, 0x40, 0x80, 0x00, 0x81, 0x3e, 0xdf, 0xf3, 0x03, 0x17, 0x90, 0xdc, 0x97, 0x75, 0xe5, 0xd9,
-    0x54, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-};
-static const unsigned int ICON_HEADPHONES_size = sizeof(ICON_HEADPHONES);
-
-// Valid 32x32 solid RGBA PNG (hover - bright)
-static const unsigned char ICON_HEADPHONES_HOVER[] = {
-    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
-    0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x08, 0x06, 0x00, 0x00, 0x00, 0x73, 0x7a, 0x7a,
-    0xf4, 0x00, 0x00, 0x00, 0x34, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0xed, 0xd7, 0x31, 0x11, 0x00,
-    0x00, 0x0c, 0x02, 0x31, 0xfc, 0x2b, 0x43, 0x44, 0xbd, 0xb4, 0x32, 0xba, 0x64, 0x60, 0xff, 0xcb,
-    0x46, 0xda, 0xd9, 0xcf, 0x45, 0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x00, 0x01,
-    0x02, 0x04, 0x08, 0x10, 0x20, 0xd0, 0xe7, 0x7b, 0x7e, 0xd3, 0xd1, 0xac, 0xc4, 0xb2, 0xa3, 0xa2,
-    0xd1, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-};
-static const unsigned int ICON_HEADPHONES_HOVER_size = sizeof(ICON_HEADPHONES_HOVER);
+#define V_REVISION 1
 
 // Global variables — all POD/trivial to avoid DllMain issues
 HMODULE hSelf;
@@ -546,12 +517,14 @@ void AddonLoad(AddonAPI_t* aApi) {
     g_DiscordIPC->Start(GetEffectiveAppId());
     g_RichPresence = new RichPresence(g_DiscordIPC);
     g_MumbleLink = (Mumble::Data*)APIDefs->DataLink_Get(DL_MUMBLE_LINK);
-    APIDefs->Events_Subscribe("EV_MUMBLE_IDENTITY_UPDATED", OnMumbleIdentityUpdated);
+    APIDefs->Events_Subscribe(EV_MUMBLE_IDENTITY_UPDATED, OnMumbleIdentityUpdated);
 
     // Set up config path
-    std::string addonDir = APIDefs->Paths_GetAddonDirectory("Discordant");
-    snprintf(g_ConfigPath, MAX_PATH, "%s\\config.json", addonDir.c_str());
-    CreateDirectoryA(addonDir.c_str(), NULL);
+    const char* addonDir = APIDefs->Paths_GetAddonDirectory("Discordant");
+    if (addonDir) {
+        snprintf(g_ConfigPath, MAX_PATH, "%s\\config.json", addonDir);
+        CreateDirectoryA(addonDir, NULL);
+    }
 
     // Load saved access token
     LoadConfig();
@@ -564,22 +537,16 @@ void AddonLoad(AddonAPI_t* aApi) {
     APIDefs->GUI_Register(RT_Render, AddonRender);
     APIDefs->GUI_Register(RT_OptionsRender, AddonOptions);
 
-
-    // Load icon textures from embedded PNG data
-    APIDefs->Textures_LoadFromMemory(TEX_ICON, (void*)ICON_HEADPHONES, ICON_HEADPHONES_size, nullptr);
-    APIDefs->Textures_LoadFromMemory(TEX_ICON_HOVER, (void*)ICON_HEADPHONES_HOVER, ICON_HEADPHONES_HOVER_size, nullptr);
-
-    // Register quick access shortcut
-    APIDefs->QuickAccess_Add(QA_ID, TEX_ICON, TEX_ICON_HOVER, "KB_DISCORDANT_TOGGLE", "Discordant");
-
-
-    APIDefs->Log(LOGL_INFO, "Discordant", "Addon loaded v2 - with logging");
+    APIDefs->Log(LOGL_INFO, "Discordant", "Addon loaded");
 }
 
 void AddonUnload() {
-    SaveConfig();
+    // Stop Nexus calling into us before anything is torn down
+    APIDefs->GUI_Deregister(AddonOptions);
+    APIDefs->GUI_Deregister(AddonRender);
+    APIDefs->Events_Unsubscribe(EV_MUMBLE_IDENTITY_UPDATED, OnMumbleIdentityUpdated);
 
-    APIDefs->Events_Unsubscribe("EV_MUMBLE_IDENTITY_UPDATED", OnMumbleIdentityUpdated);
+    SaveConfig();
     g_MumbleLink = nullptr;
 
     if (g_RichPresence) {
@@ -600,10 +567,6 @@ void AddonUnload() {
         g_Discord = nullptr;
     }
 
-    APIDefs->QuickAccess_Remove(QA_ID);
-    APIDefs->GUI_Deregister(AddonOptions);
-    APIDefs->GUI_Deregister(AddonRender);
-
     APIDefs = nullptr;
 }
 
@@ -616,7 +579,10 @@ void AddonRender() {
         RPGameState rpState;
         rpState.inGame     = g_MumbleLink && g_MumbleLink->UITick > 0
                              && g_MumbleIdentity.Name[0] != '\0';
-        rpState.charName        = g_MumbleIdentity.Name;
+        // Name is a fixed 20-byte field with no guarantee of a terminator
+        rpState.charName        = std::string(g_MumbleIdentity.Name,
+                                              strnlen(g_MumbleIdentity.Name,
+                                                      sizeof(g_MumbleIdentity.Name)));
         rpState.mapId           = g_MumbleIdentity.MapID;
         rpState.profession      = static_cast<unsigned>(g_MumbleIdentity.Profession);
         rpState.specialization  = g_MumbleIdentity.Specialization;
@@ -760,7 +726,7 @@ extern "C" __declspec(dllexport) AddonDefinition_t* GetAddonDef() {
     AddonDef.Unload = AddonUnload;
     AddonDef.Flags = AF_None;
     AddonDef.Provider = UP_None;
-    AddonDef.UpdateLink = "";
+    AddonDef.UpdateLink = nullptr;
 
     return &AddonDef;
 }

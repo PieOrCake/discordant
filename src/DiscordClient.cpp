@@ -106,6 +106,16 @@ std::string DiscordClient::GetStatusText() const {
 
 void DiscordClient::NetworkThreadMain() {
     QueueLog("Network thread started");
+    try {
+        NetworkLoop();
+    } catch (...) {
+        // Never let an exception escape a thread — that kills the game
+        m_state.store(DiscordState::Disconnected);
+        QueueLog("Network thread aborted after an unhandled error");
+    }
+}
+
+void DiscordClient::NetworkLoop() {
     while (m_running.load()) {
         // Handle token exchange completion
         if (m_tokenExchangePending.load()) {
@@ -207,23 +217,44 @@ void DiscordClient::NetworkThreadMain() {
     }
 }
 
+// Returns a pointer to an object-valued member, or nullptr if absent/not an object.
+static const json* ObjectMember(const json& j, const char* key) {
+    auto it = j.find(key);
+    return (it != j.end() && it->is_object()) ? &(*it) : nullptr;
+}
+
+static std::string StringMember(const json& j, const char* key) {
+    auto it = j.find(key);
+    return (it != j.end() && it->is_string()) ? it->get<std::string>() : std::string();
+}
+
 static VoiceUser ParseVoiceUserFromJSON(const nlohmann::json& d) {
     VoiceUser u;
-    u.id       = d["user"].value("id", "");
-    u.username = d["user"].value("username", "");
-    u.avatar   = d["user"].contains("avatar") && d["user"]["avatar"].is_string()
-                     ? d["user"]["avatar"].get<std::string>() : "";
-    u.nick     = d.contains("nick") && d["nick"].is_string()
-                     ? d["nick"].get<std::string>() : "";
-    if (d.contains("voice_state")) {
-        const auto& vs = d["voice_state"];
-        u.mute = vs.value("mute", false) || vs.value("self_mute", false) || vs.value("suppress", false);
-        u.deaf = vs.value("deaf", false) || vs.value("self_deaf", false);
+    if (const json* user = ObjectMember(d, "user")) {
+        u.id       = StringMember(*user, "id");
+        u.username = StringMember(*user, "username");
+        u.avatar   = StringMember(*user, "avatar");
+    }
+    u.nick = StringMember(d, "nick");
+    if (const json* vs = ObjectMember(d, "voice_state")) {
+        u.mute = vs->value("mute", false) || vs->value("self_mute", false) || vs->value("suppress", false);
+        u.deaf = vs->value("deaf", false) || vs->value("self_deaf", false);
     }
     return u;
 }
 
 void DiscordClient::HandleMessage(const std::string& message) {
+    try {
+        HandleMessageImpl(message);
+    } catch (const std::exception& e) {
+        // An escaped exception on this thread would terminate the whole game
+        QueueLog(std::string("HandleMessage: unhandled error: ") + e.what());
+    } catch (...) {
+        QueueLog("HandleMessage: unhandled error");
+    }
+}
+
+void DiscordClient::HandleMessageImpl(const std::string& message) {
 
     json j;
     try {
@@ -233,8 +264,12 @@ void DiscordClient::HandleMessage(const std::string& message) {
         return;
     }
 
-    std::string cmd = j.contains("cmd") && j["cmd"].is_string() ? j["cmd"].get<std::string>() : "";
-    std::string evt = j.contains("evt") && j["evt"].is_string() ? j["evt"].get<std::string>() : "";
+    std::string cmd = StringMember(j, "cmd");
+    std::string evt = StringMember(j, "evt");
+
+    // Discord also replies with error frames that carry no "data" object at all,
+    // so every handler below must tolerate it being missing.
+    const json* data = ObjectMember(j, "data");
 
     // --- DISPATCH events ---
     if (cmd == "DISPATCH") {
@@ -249,32 +284,33 @@ void DiscordClient::HandleMessage(const std::string& message) {
         }
 
         if (evt == "VOICE_STATE_UPDATE") {
-            try {
-                std::lock_guard<std::mutex> lock(m_userMutex);
-                VoiceUser u = ParseVoiceUserFromJSON(j["data"]);
-                UpdateUser(u.id, u);
-            } catch (...) {
-                QueueLog("HandleMessage: voice state parse error");
-            }
+            if (!data) return;
+            std::lock_guard<std::mutex> lock(m_userMutex);
+            VoiceUser u = ParseVoiceUserFromJSON(*data);
+            if (!u.id.empty()) UpdateUser(u.id, u);
             return;
         }
 
         if (evt == "VOICE_STATE_CREATE") {
-            try {
-                std::lock_guard<std::mutex> lock(m_userMutex);
-                VoiceUser u = ParseVoiceUserFromJSON(j["data"]);
-                UpdateUser(u.id, u);
-                if (u.id == m_userId)
-                    RequestSelectedVoiceChannel();
-            } catch (...) {
-                QueueLog("HandleMessage: voice state parse error");
-            }
+            if (!data) return;
+            std::lock_guard<std::mutex> lock(m_userMutex);
+            VoiceUser u = ParseVoiceUserFromJSON(*data);
+            if (u.id.empty()) return;
+            UpdateUser(u.id, u);
+            if (u.id == m_userId)
+                RequestSelectedVoiceChannel();
             return;
         }
 
         if (evt == "VOICE_STATE_DELETE") {
+            if (!data) return;
             std::lock_guard<std::mutex> lock(m_userMutex);
-            std::string uid = j["data"]["user"].value("id", "");
+            // Discord sends the departing user as either a nested object or a flat id
+            std::string uid;
+            if (const json* user = ObjectMember(*data, "user"))
+                uid = StringMember(*user, "id");
+            if (uid.empty()) uid = StringMember(*data, "user_id");
+            if (uid.empty()) return;
             RemoveUser(uid);
             if (uid == m_userId) {
                 m_users.clear();
@@ -283,28 +319,21 @@ void DiscordClient::HandleMessage(const std::string& message) {
             return;
         }
 
-        if (evt == "SPEAKING_START") {
+        if (evt == "SPEAKING_START" || evt == "SPEAKING_STOP") {
+            if (!data) return;
+            bool speaking = (evt == "SPEAKING_START");
             std::lock_guard<std::mutex> lock(m_userMutex);
-            std::string uid = j["data"].value("user_id", "");
+            std::string uid = StringMember(*data, "user_id");
+            if (uid.empty()) return;
             for (auto& u : m_users) {
-                if (u.id == uid) { u.speaking = true; break; }
-            }
-            return;
-        }
-
-        if (evt == "SPEAKING_STOP") {
-            std::lock_guard<std::mutex> lock(m_userMutex);
-            std::string uid = j["data"].value("user_id", "");
-            for (auto& u : m_users) {
-                if (u.id == uid) { u.speaking = false; break; }
+                if (u.id == uid) { u.speaking = speaking; break; }
             }
             return;
         }
 
         if (evt == "VOICE_CHANNEL_SELECT") {
-            auto& d = j["data"];
-            std::string chId = d.contains("channel_id") && d["channel_id"].is_string() ? d["channel_id"].get<std::string>() : "";
-            std::string guildId = d.contains("guild_id") && d["guild_id"].is_string() ? d["guild_id"].get<std::string>() : "";
+            if (!data) return;
+            std::string chId = StringMember(*data, "channel_id");
             if (!chId.empty()) {
                 if (chId != m_currentVoice) {
                     if (!m_currentVoice.empty()) {
@@ -336,9 +365,9 @@ void DiscordClient::HandleMessage(const std::string& message) {
         }
 
         if (evt == "VOICE_SETTINGS_UPDATE") {
-            auto& d = j["data"];
-            m_selfMuted = d.value("mute", false);
-            m_selfDeafened = d.value("deaf", false);
+            if (!data) return;
+            m_selfMuted = data->value("mute", false);
+            m_selfDeafened = data->value("deaf", false);
             return;
         }
 
@@ -348,8 +377,8 @@ void DiscordClient::HandleMessage(const std::string& message) {
 
     // --- Command responses ---
     if (cmd == "AUTHORIZE") {
-        if (j.contains("data") && j["data"].contains("code")) {
-            std::string code = j["data"]["code"];
+        std::string code = data ? StringMember(*data, "code") : std::string();
+        if (!code.empty()) {
             ExchangeToken(code);
         } else {
             // Authorization denied
@@ -366,8 +395,9 @@ void DiscordClient::HandleMessage(const std::string& message) {
             StartAuthorize();
             return;
         }
-        if (j.contains("data") && j["data"].contains("user")) {
-            m_userId = j["data"]["user"].value("id", "");
+        if (data) {
+            if (const json* user = ObjectMember(*data, "user"))
+                m_userId = StringMember(*user, "id");
             m_state.store(DiscordState::Connected);
             SubscribeGlobalEvents();
             RequestSelectedVoiceChannel();
@@ -376,7 +406,7 @@ void DiscordClient::HandleMessage(const std::string& message) {
     }
 
     if (cmd == "GET_SELECTED_VOICE_CHANNEL") {
-        if (!j.contains("data") || j["data"].is_null()) {
+        if (!data) {
             // Not in a voice channel
             if (!m_currentVoice.empty()) {
                 UnsubscribeVoiceChannel(m_currentVoice);
@@ -390,10 +420,9 @@ void DiscordClient::HandleMessage(const std::string& message) {
             return;
         }
 
-        auto& d = j["data"];
-        std::string chId = d.contains("id") && d["id"].is_string() ? d["id"].get<std::string>() : "";
-        std::string guildId = d.contains("guild_id") && d["guild_id"].is_string() ? d["guild_id"].get<std::string>() : "";
-        std::string chName = d.contains("name") && d["name"].is_string() ? d["name"].get<std::string>() : "";
+        const json& d = *data;
+        std::string chId   = StringMember(d, "id");
+        std::string chName = StringMember(d, "name");
 
         if (chId != m_currentVoice) {
             if (!m_currentVoice.empty()) {
@@ -409,20 +438,18 @@ void DiscordClient::HandleMessage(const std::string& message) {
             // Parse channel icon_emoji
             m_channelIconId.clear();
             m_channelIconName.clear();
-            if (d.contains("icon_emoji") && d["icon_emoji"].is_object()) {
-                auto& ie = d["icon_emoji"];
-                m_channelIconId = ie.contains("id") && ie["id"].is_string() ? ie["id"].get<std::string>() : "";
-                m_channelIconName = ie.contains("name") && ie["name"].is_string() ? ie["name"].get<std::string>() : "";
+            if (const json* ie = ObjectMember(d, "icon_emoji")) {
+                m_channelIconId   = StringMember(*ie, "id");
+                m_channelIconName = StringMember(*ie, "name");
             }
             m_users.clear();
 
-            if (d.contains("voice_states") && d["voice_states"].is_array()) {
-                for (const auto& vs : d["voice_states"]) {
-                    try {
-                        m_users.push_back(ParseVoiceUserFromJSON(vs));
-                    } catch (...) {
-                        QueueLog("HandleMessage: voice state parse error");
-                    }
+            auto vsIt = d.find("voice_states");
+            if (vsIt != d.end() && vsIt->is_array()) {
+                for (const auto& vs : *vsIt) {
+                    if (!vs.is_object()) continue;
+                    VoiceUser u = ParseVoiceUserFromJSON(vs);
+                    if (!u.id.empty()) m_users.push_back(u);
                 }
             }
         }
@@ -463,6 +490,7 @@ void DiscordClient::ExchangeToken(const std::string& code) {
 
     std::string codeCopy = code;
     m_tokenThread = std::thread([this, codeCopy]() {
+      try {
         QueueLog("ExchangeToken thread: InternetOpenA...");
         HINTERNET hInet = InternetOpenA("Discordant/1.0", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
         if (!hInet) { QueueLog("ExchangeToken: InternetOpenA failed"); m_tokenExchangeFailed.store(true); return; }
@@ -528,6 +556,10 @@ void DiscordClient::ExchangeToken(const std::string& code) {
             QueueLog("ExchangeToken: JSON parse failed");
             m_tokenExchangeFailed.store(true);
         }
+      } catch (...) {
+        // Never let an exception escape a thread
+        m_tokenExchangeFailed.store(true);
+      }
     });
 }
 

@@ -107,7 +107,9 @@ std::string RichPresence::BuildActivityJson(const RPGameState& state, const RPCo
     j["nonce"]         = "rp_" + std::to_string(++m_nonce);
     j["args"]["pid"]   = (int)GetCurrentProcessId();
     j["args"]["activity"] = activity;
-    return j.dump();
+    // Character names arrive from a fixed-size MumbleLink buffer and can be cut
+    // mid-character; dump() throws on invalid UTF-8, so substitute instead.
+    return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
 const char* RichPresence::ProfessionName(unsigned prof) {

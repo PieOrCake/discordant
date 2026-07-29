@@ -34,6 +34,7 @@ public:
 private:
     void QueueLog(const std::string& msg);
     void ThreadMain();
+    void ThreadLoop();
     bool Connect();
     void Disconnect();
     bool SendFrame(uint32_t opcode, const std::string& payload);

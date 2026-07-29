@@ -93,6 +93,7 @@ private:
 
     // Process a received JSON message.
     void HandleMessage(const std::string& message);
+    void HandleMessageImpl(const std::string& message);
 
     // Auth flow helpers
     void StartAuthorize();
@@ -113,6 +114,7 @@ private:
 
     // Background thread for all networking
     void NetworkThreadMain();
+    void NetworkLoop();
     std::thread m_networkThread;
     std::atomic<bool> m_running{false};
 
