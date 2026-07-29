@@ -721,7 +721,7 @@ extern "C" __declspec(dllexport) AddonDefinition_t* GetAddonDef() {
     AddonDef.Version.Build = V_BUILD;
     AddonDef.Version.Revision = V_REVISION;
     AddonDef.Author = "discordant";
-    AddonDef.Description = "Discord voice channel overlay for Guild Wars 2";
+    AddonDef.Description = "Discord overlay and rich presence.";
     AddonDef.Load = AddonLoad;
     AddonDef.Unload = AddonUnload;
     AddonDef.Flags = AF_None;
