@@ -44,33 +44,25 @@ public:
     DiscordClient();
     ~DiscordClient();
 
-    // Initiate connection. Starts background networking thread.
+    // Start the background networking thread. If it is already running and
+    // waiting to retry, retry immediately instead.
     void Connect();
 
-    // Disconnect and reset state.
+    // Stop the networking thread and reset state. Blocks until threads exit.
     void Disconnect();
 
-    // Set a cached access token (loaded from config).
-    void SetAccessToken(const std::string& token) { m_accessToken = token; }
+    // Access token (loaded from / saved to config). Thread-safe.
+    void SetAccessToken(const std::string& token);
+    std::string GetAccessToken() const;
 
-    // Get current access token (for saving to config).
-    std::string GetAccessToken() const { return m_accessToken; }
+    // Bumped every time the network thread changes the token, so the render
+    // thread can cheaply tell when it needs saving.
+    uint32_t GetTokenGeneration() const { return m_tokenGeneration.load(); }
 
     // Get current connection state.
     DiscordState GetState() const { return m_state.load(); }
 
-    // Get a snapshot of users currently in the voice channel.
-    // Thread-safe: locks internally.
-    std::vector<VoiceUser> GetVoiceUsers();
-
-    // Get the name of the current voice channel (empty if none).
-    std::string GetChannelName();
-
-    // Get channel icon info (custom emoji ID or unicode emoji name).
-    std::string GetChannelIconId();
-    std::string GetChannelIconName();
-
-    // Get all voice state in one lock (avoids 4 separate mutex acquisitions per frame).
+    // Get all voice state in one lock.
     VoiceSnapshot GetVoiceSnapshot();
 
     // Get connection status text for display.
@@ -78,10 +70,6 @@ public:
 
     // Drain pending log messages (call from render thread to forward to Nexus log).
     std::vector<std::string> DrainLogQueue();
-
-    // Whether the local user is muted/deafened
-    bool IsSelfMuted() const { return m_selfMuted; }
-    bool IsSelfDeafened() const { return m_selfDeafened; }
 
 private:
     // StreamKit's approved client ID
@@ -98,7 +86,9 @@ private:
     // Auth flow helpers
     void StartAuthorize();
     void ExchangeToken(const std::string& code);
+    void TokenThreadMain(std::string code);
     void Authenticate();
+    void StoreToken(const std::string& token);
 
     // Subscription helpers
     void SubscribeVoiceChannel(const std::string& channelId);
@@ -112,6 +102,9 @@ private:
     void UpdateUser(const std::string& id, const VoiceUser& partial);
     void RemoveUser(const std::string& id);
 
+    // Drop the connection and all voice state, retry after delayMs.
+    void ResetConnection(uint64_t delayMs);
+
     // Background thread for all networking
     void NetworkThreadMain();
     void NetworkLoop();
@@ -120,36 +113,37 @@ private:
 
     WebSocket m_ws;
     std::atomic<DiscordState> m_state{DiscordState::Disconnected};
+    std::string m_userId;        // our own user ID (network thread only)
+    std::string m_currentVoice;  // current voice channel ID (network thread only)
+
+    // Guarded by m_tokenMutex
+    mutable std::mutex m_tokenMutex;
     std::string m_accessToken;
-    std::string m_userId;        // our own user ID
-    std::string m_currentVoice;  // current voice channel ID
-    std::string m_channelName;
-    std::string m_channelIconId;    // custom emoji ID (empty for unicode)
-    std::string m_channelIconName;  // emoji name or unicode character
-    bool m_selfMuted = false;
-    bool m_selfDeafened = false;
+    std::string m_pendingAccessToken;
+    std::atomic<uint32_t> m_tokenGeneration{0};
 
     // Reconnect timing
-    uint64_t m_reconnectAt = 0;  // GetTickCount64() value
-    int m_currentPort;           // port being tried
+    std::atomic<uint64_t> m_reconnectAt{0};  // GetTickCount64() value
+    int m_currentPort;                       // port being tried
 
     // Diagnostics: when we entered WaitingForReady, so a Discord client that
     // accepts the socket but never sends READY doesn't just sit there silently.
     uint64_t m_waitingForReadyAt = 0;
     bool m_readyTimeoutLogged = false;
 
-    // Voice user list
+    // Voice state, guarded by m_userMutex
     std::mutex m_userMutex;
     std::vector<VoiceUser> m_users;  // maintained in channel join order
+    std::string m_channelName;
+    std::string m_channelIconId;    // custom emoji ID (empty for unicode)
+    std::string m_channelIconName;  // emoji name or unicode character
 
     // Token exchange runs on a background thread
     std::atomic<bool> m_tokenExchangePending{false};
     std::atomic<bool> m_tokenExchangeFailed{false};
-    std::mutex m_tokenMutex;
-    std::string m_pendingAccessToken;  // protected by m_tokenMutex
     std::thread m_tokenThread;
 
-    // Thread-safe log queue (written by network thread, drained by render thread)
+    // Thread-safe log queue (written by background threads, drained by render thread)
     void QueueLog(const std::string& msg);
     std::vector<std::string> m_logQueue;
     std::mutex m_logMutex;

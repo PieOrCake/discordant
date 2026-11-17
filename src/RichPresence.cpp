@@ -7,8 +7,11 @@
 using json = nlohmann::json;
 
 void RichPresence::QueueLog(const std::string& msg) {
-    std::lock_guard<std::mutex> lock(m_logMutex);
-    m_logQueue.push_back(msg);
+    try {
+        std::lock_guard<std::mutex> lock(m_logMutex);
+        if (m_logQueue.size() < 500)
+            m_logQueue.push_back(msg);
+    } catch (...) {}
 }
 
 std::vector<std::string> RichPresence::DrainLogQueue() {

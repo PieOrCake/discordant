@@ -39,8 +39,13 @@ private:
     void Disconnect();
     bool SendFrame(uint32_t opcode, const std::string& payload);
     bool ReadFrame(uint32_t& opcode, std::string& payload);
+    bool PipeIo(bool write, void* buf, DWORD len);
+    void SendPendingActivity();
+    void LogConnectProblem(const std::string& msg);
 
     HANDLE              m_pipe = INVALID_HANDLE_VALUE;
+    HANDLE              m_ioEvent = nullptr;     // signals overlapped pipe I/O completion
+    std::string         m_lastConnectProblem;    // so a missing Discord logs once, not every 10s
     std::string         m_appId;
     std::mutex          m_appIdMutex;
     std::atomic<bool>   m_reconnect{false};

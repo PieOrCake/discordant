@@ -22,14 +22,9 @@ static std::string Base64Encode(const unsigned char* data, size_t len) {
     return out;
 }
 
-static void EnsureWSAStartup() {
-    static bool wsaInited = false;
-    if (!wsaInited) {
-        WSADATA wsa;
-        WSAStartup(MAKEWORD(2, 2), &wsa);
-        wsaInited = true;
-    }
-}
+// Largest message we will buffer. Discord's RPC messages are a few KB; anything
+// near this means the stream is corrupt.
+static constexpr uint64_t MAX_MESSAGE_SIZE = 4ull * 1024 * 1024;
 
 WebSocket::WebSocket()
     : m_socket(INVALID_SOCKET)
@@ -41,6 +36,8 @@ WebSocket::WebSocket()
 
 WebSocket::~WebSocket() {
     Close();
+    if (m_wsaStarted)
+        WSACleanup();
 }
 
 std::string WebSocket::GenerateKey() {
@@ -65,7 +62,13 @@ bool WebSocket::Fail(const std::string& reason, bool refused) {
 
 bool WebSocket::Connect(const std::string& host, int port, const std::string& path,
                         const std::string& origin) {
-    EnsureWSAStartup();
+    if (!m_wsaStarted) {
+        WSADATA wsa;
+        int err = WSAStartup(MAKEWORD(2, 2), &wsa);
+        if (err != 0)
+            return Fail("WSAStartup failed, error " + std::to_string(err), false);
+        m_wsaStarted = true;
+    }
     Close();
     m_lastError.clear();
     m_lastErrorRefused = false;
@@ -176,7 +179,7 @@ bool WebSocket::Connect(const std::string& host, int port, const std::string& pa
     // Verify we got a 101 Switching Protocols. If not, the status line is the
     // single most useful thing we can report — Discord rejects bad Origin or
     // client_id with a 4xx here.
-    if (!strstr(buf, "101")) {
+    if (strncmp(buf, "HTTP/1.1 101", 12) != 0) {
         std::string statusLine(buf, buf + total);
         size_t eol = statusLine.find("\r\n");
         if (eol != std::string::npos) statusLine.resize(eol);
@@ -203,10 +206,22 @@ bool WebSocket::Connect(const std::string& host, int port, const std::string& pa
 }
 
 bool WebSocket::SendRaw(const char* data, int len) {
+    if (m_socket == INVALID_SOCKET) return false;
     int sent = 0;
     while (sent < len) {
         int n = send(m_socket, data + sent, len - sent, 0);
-        if (n == SOCKET_ERROR) return false;
+        if (n == SOCKET_ERROR) {
+            if (WSAGetLastError() == WSAEWOULDBLOCK) {
+                // Non-blocking socket with a full send buffer: wait up to 1s for room
+                fd_set writefds;
+                FD_ZERO(&writefds);
+                FD_SET(m_socket, &writefds);
+                struct timeval tv = {1, 0};
+                if (select(0, NULL, &writefds, NULL, &tv) > 0) continue;
+            }
+            m_state = State::Disconnected;
+            return false;
+        }
         sent += n;
     }
     return true;
@@ -302,12 +317,19 @@ std::vector<std::string> WebSocket::ParseFrames() {
             pos += 4;
         }
 
-        if (m_recvBuf.size() < pos + payloadLen) break; // need more data
+        if (payloadLen > MAX_MESSAGE_SIZE
+            || m_fragmentBuf.size() + payloadLen > MAX_MESSAGE_SIZE) {
+            // Garbage length: the stream is desynced, drop the connection
+            m_recvBuf.clear();
+            m_fragmentBuf.clear();
+            m_state = State::Disconnected;
+            break;
+        }
+        if (m_recvBuf.size() - pos < payloadLen) break; // need more data
 
         // Extract payload
-        std::string payload;
-        payload.resize((size_t)payloadLen);
-        for (uint64_t i = 0; i < payloadLen; i++) {
+        std::string payload((size_t)payloadLen, '\0');
+        for (size_t i = 0; i < (size_t)payloadLen; i++) {
             payload[i] = (char)(m_recvBuf[pos + i] ^ (masked ? mask[i % 4] : 0));
         }
         pos += (size_t)payloadLen;
@@ -339,6 +361,7 @@ std::vector<std::string> WebSocket::ParseFrames() {
             // Close
             SendFrame(0x08, nullptr, 0);
             m_state = State::Closing;
+            break;
         } else if (opcode == 0x09) {
             // Ping — respond with pong
             SendFrame(0x0A, (const uint8_t*)payload.data(), payload.size());

@@ -5,7 +5,6 @@
 #include <ws2tcpip.h>
 #include <string>
 #include <vector>
-#include <functional>
 #include <cstdint>
 
 // Minimal WebSocket client for localhost connections (no TLS).
@@ -52,7 +51,8 @@ private:
     // Generate a random 16-byte masking key (base64-encoded for Sec-WebSocket-Key).
     static std::string GenerateKey();
 
-    // Send raw bytes.
+    // Send raw bytes. Waits briefly if the socket buffer is full; on failure
+    // the connection is marked dropped, since a half-sent frame corrupts the stream.
     bool SendRaw(const char* data, int len);
 
     // Receive into internal buffer. Returns false on error/disconnect.
@@ -66,6 +66,7 @@ private:
 
     SOCKET m_socket;
     State m_state;
+    bool m_wsaStarted = false;
     std::string m_lastError;
     bool m_lastErrorRefused;
     std::vector<uint8_t> m_recvBuf;

@@ -2,8 +2,12 @@
 #include <shellapi.h>
 #include <string>
 #include <cstring>
+#include <cstdio>
+#include <cmath>
 #include <fstream>
 #include <unordered_map>
+#include <vector>
+#include <algorithm>
 
 #include "nexus/Nexus.h"
 #include "mumble/Mumble.h"
@@ -17,24 +21,40 @@
 // Version constants
 #define V_MAJOR 0
 #define V_MINOR 9
-#define V_BUILD 3
+#define V_BUILD 4
 #define V_REVISION 0
 
 // Global variables — all POD/trivial to avoid DllMain issues
 HMODULE hSelf;
 AddonDefinition_t AddonDef{};
 AddonAPI_t* APIDefs = nullptr;
-bool g_ShowAvatars = true;
-bool g_LockPosition = false;
-bool g_ShowChannelName = true;
-float g_OverlayAlpha = 0.85f;
+
+// Settings
+bool  g_ShowAvatars = true;
+bool  g_ShowNames = true;
+bool  g_LockPosition = false;
+bool  g_ShowChannelName = true;
+bool  g_SpeakingOnly = false;
+bool  g_HideWhenNotInVoice = false;
+bool  g_GrowUpward = false;
+bool  g_HideOnHover = false;
 float g_OverlayScale = 1.0f;
-float g_ColSpeaking[4]  = {0.90f, 0.90f, 0.90f, 1.0f};
-float g_ColSilent[4]    = {0.55f, 0.55f, 0.55f, 1.0f};
-float g_ColMuted[4]     = {0.93f, 0.26f, 0.26f, 1.0f};
-float g_ColChannel[4]   = {0.34f, 0.40f, 0.96f, 1.0f};
-bool g_GrowUpward = false;
-bool g_HideOnHover = false;
+float g_AvatarSize = 24.0f;
+float g_ColBackground[4] = {0.12f, 0.13f, 0.15f, 0.85f};
+float g_ColSpeaking[4]   = {0.90f, 0.90f, 0.90f, 1.0f};
+float g_ColSilent[4]     = {0.55f, 0.55f, 0.55f, 1.0f};
+float g_ColMuted[4]      = {0.93f, 0.26f, 0.26f, 1.0f};
+float g_ColChannel[4]    = {0.34f, 0.40f, 0.96f, 1.0f};
+
+// Saved overlay position. Y is the top edge when growing downward and the
+// bottom edge when growing upward, so the fixed edge is what gets restored.
+bool  g_HasPos = false;
+float g_PosX = 0.0f;
+float g_PosY = 0.0f;
+
+static constexpr float AVATAR_SIZE_MIN = 16.0f;
+static constexpr float AVATAR_SIZE_MAX = 64.0f;
+
 DiscordClient* g_Discord = nullptr;
 
 // MumbleLink
@@ -50,6 +70,35 @@ static char          g_RPAppIdOverride[64] = {0};
 // Config file path (set during load)
 static char g_ConfigPath[MAX_PATH] = {0};
 
+// Config is saved shortly after the last change, not on every slider tick
+static bool      g_ConfigDirty = false;
+static ULONGLONG g_ConfigDirtyAt = 0;
+
+// Frame on which the Nexus options panel last drew our settings
+static int g_OptionsFrame = -100;
+
+// Avatar/emoji download bookkeeping and overlay window state.
+// Heap-allocated in AddonLoad: no non-trivial globals (DllMain constraint).
+struct TexRequest {
+    ULONGLONG nextTryAt = 0;
+    int attempts = 0;
+};
+struct OverlayState {
+    std::unordered_map<std::string, TexRequest> texRequests;
+    std::vector<VoiceUser> visibleUsers;
+    std::vector<Texture_t*> userTextures;
+    ULONGLONG hideUntil = 0;
+    bool wasHovered = false;
+    ImVec2 lastPos{0, 0};
+    ImVec2 lastSize{0, 0};
+    bool posApplied = false;
+    bool anchorSet = false;
+    float anchorBottom = 0.0f;
+    int framesShown = 0;
+};
+static OverlayState* g_Overlay = nullptr;
+static bool g_MumbleSubscribed = false;
+
 static void OnMumbleIdentityUpdated(void* eventArgs) {
     if (!eventArgs) return;
     g_MumbleIdentity = *reinterpret_cast<const Mumble::Identity*>(eventArgs);
@@ -61,6 +110,10 @@ static std::string GetEffectiveAppId() {
     return DISCORD_APP_ID;
 }
 
+static void Log(ELogLevel level, const char* msg) {
+    if (APIDefs) APIDefs->Log(level, "Discordant", msg);
+}
+
 // Forward declarations
 void AddonLoad(AddonAPI_t* aApi);
 void AddonUnload();
@@ -69,441 +122,485 @@ void AddonOptions();
 
 // --- Config persistence ---
 
+static void MarkConfigDirty() {
+    g_ConfigDirty = true;
+    g_ConfigDirtyAt = GetTickCount64();
+}
+
+// Read one setting, leaving the default in place if it is missing or the
+// wrong type — one bad value must not discard every setting after it.
+template <typename T>
+static void ReadKey(const nlohmann::json& j, const char* key, T& out) {
+    auto it = j.find(key);
+    if (it == j.end()) return;
+    try { out = it->get<T>(); } catch (...) {}
+}
+
+static void ReadColor(const nlohmann::json& j, const char* key, float* dst) {
+    auto it = j.find(key);
+    if (it == j.end() || !it->is_array() || it->size() != 4) return;
+    for (const auto& v : *it)
+        if (!v.is_number()) return;
+    for (int i = 0; i < 4; i++)
+        dst[i] = std::clamp((*it)[i].get<float>(), 0.0f, 1.0f);
+}
+
 static void LoadConfig() {
-    if (!g_Discord) return;
-    try {
-        std::ifstream f(g_ConfigPath);
-        if (f.good()) {
-            nlohmann::json j;
-            f >> j;
-            if (j.contains("access_token")) {
-                g_Discord->SetAccessToken(j["access_token"].get<std::string>());
-            }
-            if (j.contains("show_avatars")) {
-                g_ShowAvatars = j["show_avatars"].get<bool>();
-            }
-            if (j.contains("lock_position")) {
-                g_LockPosition = j["lock_position"].get<bool>();
-            }
-            if (j.contains("show_channel_name")) {
-                g_ShowChannelName = j["show_channel_name"].get<bool>();
-            }
-            if (j.contains("overlay_alpha")) {
-                g_OverlayAlpha = j["overlay_alpha"].get<float>();
-                if (g_OverlayAlpha < 0.1f) g_OverlayAlpha = 0.1f;
-                if (g_OverlayAlpha > 1.0f) g_OverlayAlpha = 1.0f;
-            }
-            if (j.contains("overlay_scale")) {
-                g_OverlayScale = j["overlay_scale"].get<float>();
-                if (g_OverlayScale < 0.5f) g_OverlayScale = 0.5f;
-                if (g_OverlayScale > 2.0f) g_OverlayScale = 2.0f;
-            }
-            auto loadCol = [&](const char* key, float* dst) {
-                if (j.contains(key) && j[key].is_array() && j[key].size() == 4)
-                    for (int i = 0; i < 4; i++) dst[i] = j[key][i].get<float>();
-            };
-            if (j.contains("grow_upward")) {
-                g_GrowUpward = j["grow_upward"].get<bool>();
-            }
-            if (j.contains("hide_on_hover")) {
-                g_HideOnHover = j["hide_on_hover"].get<bool>();
-            }
-            if (j.contains("rp_enabled"))      g_RPConfig.enabled        = j["rp_enabled"].get<bool>();
-            if (j.contains("rp_show_name"))     g_RPConfig.showCharName   = j["rp_show_name"].get<bool>();
-            if (j.contains("rp_show_map"))      g_RPConfig.showMap        = j["rp_show_map"].get<bool>();
-            if (j.contains("rp_show_prof"))     g_RPConfig.showProfession = j["rp_show_prof"].get<bool>();
-            if (j.contains("rp_app_id")) {
-                std::string aid = j["rp_app_id"].get<std::string>();
-                strncpy(g_RPAppIdOverride, aid.c_str(), sizeof(g_RPAppIdOverride) - 1);
-            }
-            loadCol("col_speaking", g_ColSpeaking);
-            loadCol("col_silent", g_ColSilent);
-            loadCol("col_muted", g_ColMuted);
-            loadCol("col_channel", g_ColChannel);
+    if (g_ConfigPath[0] == '\0') return;
+    std::ifstream f(g_ConfigPath);
+    if (!f.good()) return;  // first run
+
+    nlohmann::json j = nlohmann::json::parse(f, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) {
+        Log(LOGL_WARNING, "config.json is unreadable; using default settings");
+        return;
+    }
+
+    std::string token;
+    ReadKey(j, "access_token", token);
+    if (g_Discord && !token.empty()) g_Discord->SetAccessToken(token);
+
+    ReadKey(j, "show_avatars", g_ShowAvatars);
+    ReadKey(j, "show_names", g_ShowNames);
+    ReadKey(j, "lock_position", g_LockPosition);
+    ReadKey(j, "show_channel_name", g_ShowChannelName);
+    ReadKey(j, "speaking_only", g_SpeakingOnly);
+    ReadKey(j, "hide_when_not_in_voice", g_HideWhenNotInVoice);
+    ReadKey(j, "grow_upward", g_GrowUpward);
+    ReadKey(j, "hide_on_hover", g_HideOnHover);
+
+    ReadKey(j, "overlay_scale", g_OverlayScale);
+    g_OverlayScale = std::clamp(g_OverlayScale, 0.5f, 2.0f);
+    ReadKey(j, "avatar_size", g_AvatarSize);
+    g_AvatarSize = std::clamp(g_AvatarSize, AVATAR_SIZE_MIN, AVATAR_SIZE_MAX);
+
+    // Older versions stored only the background alpha
+    if (j.contains("col_background")) {
+        ReadColor(j, "col_background", g_ColBackground);
+    } else {
+        float alpha = g_ColBackground[3];
+        ReadKey(j, "overlay_alpha", alpha);
+        g_ColBackground[3] = std::clamp(alpha, 0.0f, 1.0f);
+    }
+    ReadColor(j, "col_speaking", g_ColSpeaking);
+    ReadColor(j, "col_silent", g_ColSilent);
+    ReadColor(j, "col_muted", g_ColMuted);
+    ReadColor(j, "col_channel", g_ColChannel);
+
+    if (j.contains("pos_x") && j.contains("pos_y")) {
+        float x = g_PosX, y = g_PosY;
+        ReadKey(j, "pos_x", x);
+        ReadKey(j, "pos_y", y);
+        if (std::isfinite(x) && std::isfinite(y)) {
+            g_PosX = x;
+            g_PosY = y;
+            g_HasPos = true;
         }
-    } catch (...) {}
+    }
+
+    ReadKey(j, "rp_enabled", g_RPConfig.enabled);
+    ReadKey(j, "rp_show_name", g_RPConfig.showCharName);
+    ReadKey(j, "rp_show_map", g_RPConfig.showMap);
+    ReadKey(j, "rp_show_prof", g_RPConfig.showProfession);
+    std::string appId;
+    ReadKey(j, "rp_app_id", appId);
+    snprintf(g_RPAppIdOverride, sizeof(g_RPAppIdOverride), "%s", appId.c_str());
 }
 
 static void SaveConfig() {
-    if (!g_Discord) return;
+    g_ConfigDirty = false;
+    if (g_ConfigPath[0] == '\0') return;
     try {
         nlohmann::json j;
-        std::string token = g_Discord->GetAccessToken();
-        if (!token.empty()) {
+        std::string token = g_Discord ? g_Discord->GetAccessToken() : std::string();
+        if (!token.empty())
             j["access_token"] = token;
-        }
         j["show_avatars"] = g_ShowAvatars;
+        j["show_names"] = g_ShowNames;
         j["lock_position"] = g_LockPosition;
         j["show_channel_name"] = g_ShowChannelName;
-        j["overlay_alpha"] = g_OverlayAlpha;
-        j["overlay_scale"] = g_OverlayScale;
+        j["speaking_only"] = g_SpeakingOnly;
+        j["hide_when_not_in_voice"] = g_HideWhenNotInVoice;
         j["grow_upward"] = g_GrowUpward;
         j["hide_on_hover"] = g_HideOnHover;
+        j["overlay_scale"] = g_OverlayScale;
+        j["avatar_size"] = g_AvatarSize;
+        if (g_HasPos) {
+            j["pos_x"] = g_PosX;
+            j["pos_y"] = g_PosY;
+        }
         j["rp_enabled"]    = g_RPConfig.enabled;
         j["rp_show_name"]  = g_RPConfig.showCharName;
         j["rp_show_map"]   = g_RPConfig.showMap;
         j["rp_show_prof"]  = g_RPConfig.showProfession;
         j["rp_app_id"] = std::string(g_RPAppIdOverride);
-        if (g_DiscordIPC)
-            g_DiscordIPC->SetAppId(GetEffectiveAppId());
-        auto saveCol = [](float* c) -> nlohmann::json { return {c[0], c[1], c[2], c[3]}; };
-        j["col_speaking"] = saveCol(g_ColSpeaking);
-        j["col_silent"] = saveCol(g_ColSilent);
-        j["col_muted"] = saveCol(g_ColMuted);
-        j["col_channel"] = saveCol(g_ColChannel);
-        std::ofstream f(g_ConfigPath);
-        f << j.dump(2);
-    } catch (...) {}
+        auto color = [](const float* c) { return nlohmann::json{c[0], c[1], c[2], c[3]}; };
+        j["col_background"] = color(g_ColBackground);
+        j["col_speaking"] = color(g_ColSpeaking);
+        j["col_silent"] = color(g_ColSilent);
+        j["col_muted"] = color(g_ColMuted);
+        j["col_channel"] = color(g_ColChannel);
+
+        // Write a temp file then swap it in, so a crash mid-write can never
+        // leave a truncated config (and lose the Discord sign-in).
+        std::string tmpPath = std::string(g_ConfigPath) + ".tmp";
+        {
+            std::ofstream f(tmpPath, std::ios::trunc);
+            f << j.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
+            f.flush();
+            if (!f.good()) {
+                Log(LOGL_WARNING, "Could not write config.json.tmp; settings not saved");
+                return;
+            }
+        }
+        if (!MoveFileExA(tmpPath.c_str(), g_ConfigPath,
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            Log(LOGL_WARNING, "Could not replace config.json; settings not saved");
+        }
+    } catch (...) {
+        Log(LOGL_WARNING, "Saving config.json failed");
+    }
 }
 
 // DLL entry point
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
-    switch (ul_reason_for_call) {
-    case DLL_PROCESS_ATTACH: hSelf = hModule; break;
-    case DLL_PROCESS_DETACH: break;
-    case DLL_THREAD_ATTACH: break;
-    case DLL_THREAD_DETACH: break;
-    }
+    if (ul_reason_for_call == DLL_PROCESS_ATTACH) hSelf = hModule;
     return TRUE;
 }
 
 // --- Overlay Rendering ---
 
+static ImVec4 ToVec4(const float* c) { return ImVec4(c[0], c[1], c[2], c[3]); }
+
+static ImVec4 NameColor(const VoiceUser& user) {
+    if (user.deaf || user.mute) return ToVec4(g_ColMuted);
+    if (user.speaking)          return ToVec4(g_ColSpeaking);
+    return ToVec4(g_ColSilent);
+}
+
+static const std::string& DisplayName(const VoiceUser& user) {
+    return user.nick.empty() ? user.username : user.nick;
+}
+
+// First character of a UTF-8 string (1-4 bytes), for the fallback avatar.
+static std::string FirstGlyph(const std::string& s) {
+    if (s.empty()) return std::string();
+    unsigned char c = (unsigned char)s[0];
+    size_t n = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 1;
+    return s.substr(0, std::min(n, s.size()));
+}
+
+// Returns a loaded texture, or nullptr while it downloads or if it failed.
+// Asks Nexus for the pointer each frame rather than caching it, so it can
+// never dangle, and retries a failed download only a few times.
+static Texture_t* GetRemoteTexture(const std::string& id, const std::string& endpoint) {
+    Texture_t* tex = APIDefs->Textures_Get(id.c_str());
+    if (tex) return tex->Resource ? tex : nullptr;
+
+    if (g_Overlay->texRequests.size() > 256) g_Overlay->texRequests.clear();
+    TexRequest& req = g_Overlay->texRequests[id];
+    ULONGLONG now = GetTickCount64();
+    if (req.attempts >= 3 || now < req.nextTryAt) return nullptr;
+    req.attempts++;
+    req.nextTryAt = now + 15000;
+    tex = APIDefs->Textures_GetOrCreateFromURL(id.c_str(), "https://cdn.discordapp.com", endpoint.c_str());
+    return (tex && tex->Resource) ? tex : nullptr;
+}
+
+static Texture_t* GetAvatarTexture(const VoiceUser& user) {
+    if (user.avatar.empty() || user.id.empty()) return nullptr;
+    // The avatar hash is part of the ID so a changed avatar is fetched afresh
+    return GetRemoteTexture("DISCORDANT_AVATAR_" + user.id + "_" + user.avatar,
+                            "/avatars/" + user.id + "/" + user.avatar + ".png?size=64");
+}
+
+static Texture_t* GetChannelIconTexture(const std::string& iconId) {
+    if (iconId.empty()) return nullptr;
+    return GetRemoteTexture("DISCORDANT_EMOJI_" + iconId, "/emojis/" + iconId + ".png?size=32");
+}
+
 static void RenderUserDot(const VoiceUser& user) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
     float radius = 4.0f;
-    ImVec2 center = ImVec2(pos.x + radius + 1, pos.y + ImGui::GetTextLineHeight() * 0.5f);
-
-    ImVec4 dotCol(g_ColSilent[0], g_ColSilent[1], g_ColSilent[2], g_ColSilent[3]);
-    if (user.deaf || user.mute) dotCol = ImVec4(g_ColMuted[0], g_ColMuted[1], g_ColMuted[2], g_ColMuted[3]);
-    else if (user.speaking)     dotCol = ImVec4(g_ColSpeaking[0], g_ColSpeaking[1], g_ColSpeaking[2], g_ColSpeaking[3]);
-
+    ImVec2 center(pos.x + radius + 1, pos.y + ImGui::GetTextLineHeight() * 0.5f);
+    ImVec4 dotCol = NameColor(user);
     ImGui::GetWindowDrawList()->AddCircleFilled(center, radius, ImGui::ColorConvertFloat4ToU32(dotCol));
-    ImGui::Dummy(ImVec2(radius * 2 + 4, 0));
-    ImGui::SameLine();
-}
-
-// Avatar texture cache: keyed by "userId:avatarHash", value is cached Texture_t*
-struct AvatarCacheEntry {
-    Texture_t* tex = nullptr;
-    bool requested = false;
-};
-static std::unordered_map<std::string, AvatarCacheEntry> s_avatarCache;
-
-// Channel icon texture cache
-static std::string s_chanIconCacheKey;
-static AvatarCacheEntry s_chanIconCache;
-
-static Texture_t* GetCachedAvatarTexture(const VoiceUser& user) {
-    if (user.avatar.empty()) return nullptr;
-    std::string key = user.id + ":" + user.avatar;
-    auto it = s_avatarCache.find(key);
-    if (it != s_avatarCache.end()) {
-        if (it->second.tex && it->second.tex->Resource) return it->second.tex;
-        if (it->second.requested && it->second.tex) return nullptr; // pointer exists, Resource still loading
-        // tex is null — API returned nullptr while async load was in progress; retry to get pointer
-    }
-    std::string texId = "TEX_AVATAR_" + user.id;
-    std::string endpoint = "/avatars/" + user.id + "/" + user.avatar + ".png?size=32";
-    Texture_t* tex = APIDefs->Textures_GetOrCreateFromURL(texId.c_str(), "https://cdn.discordapp.com", endpoint.c_str());
-    AvatarCacheEntry& entry = s_avatarCache[key];
-    entry.tex = tex;
-    entry.requested = true;
-    return (tex && tex->Resource) ? tex : nullptr;
-}
-
-static Texture_t* GetCachedChannelIconTexture(const std::string& iconId) {
-    if (iconId.empty()) return nullptr;
-    if (s_chanIconCacheKey == iconId) {
-        if (s_chanIconCache.tex && s_chanIconCache.tex->Resource) return s_chanIconCache.tex;
-        if (s_chanIconCache.requested && s_chanIconCache.tex) return nullptr; // pointer exists, still loading
-        // tex is null — retry to get pointer
-    }
-    std::string texId = "TEX_CHANICON_" + iconId;
-    std::string endpoint = "/emojis/" + iconId + ".png?size=32";
-    Texture_t* tex = APIDefs->Textures_GetOrCreateFromURL(texId.c_str(), "https://cdn.discordapp.com", endpoint.c_str());
-    s_chanIconCacheKey = iconId;
-    s_chanIconCache.tex = tex;
-    s_chanIconCache.requested = true;
-    return (tex && tex->Resource) ? tex : nullptr;
+    ImGui::Dummy(ImVec2(radius * 2 + 4, ImGui::GetTextLineHeight()));
 }
 
 static void RenderUserAvatar(const VoiceUser& user, Texture_t* tex) {
-    float iconSize = 24.0f;
-    float iconRadius = iconSize * 0.5f;
+    float size = g_AvatarSize;
+    float radius = size * 0.5f;
+    float stroke = std::max(1.5f, size / 10.0f);
     ImVec2 pos = ImGui::GetCursorScreenPos();
-    ImVec2 center = ImVec2(pos.x + iconRadius, pos.y + iconRadius);
+    ImVec2 center(pos.x + radius, pos.y + radius);
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
     if (tex && tex->Resource) {
-        // Clip avatar to circle using draw list
-        ImVec2 uvMin(0, 0);
-        ImVec2 uvMax(1, 1);
-        ImVec2 pMin = pos;
-        ImVec2 pMax = ImVec2(pos.x + iconSize, pos.y + iconSize);
-
-        // Draw circular avatar by rendering as a square image then overlaying
-        dl->AddImageRounded(
-            (ImTextureID)tex->Resource,
-            pMin, pMax, uvMin, uvMax,
-            IM_COL32(255, 255, 255, 255),
-            iconRadius);
+        dl->AddImageRounded((ImTextureID)tex->Resource, pos, ImVec2(pos.x + size, pos.y + size),
+                            ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, 255), radius);
     } else {
-        // Fallback: draw a filled circle with first letter
-        dl->AddCircleFilled(center, iconRadius, IM_COL32(88, 101, 242, 255), 48);
-        std::string displayName = user.nick.empty() ? user.username : user.nick;
-        if (!displayName.empty()) {
-            char letter[2] = { displayName[0], 0 };
-            ImVec2 textSize = ImGui::CalcTextSize(letter);
-            dl->AddText(ImVec2(center.x - textSize.x * 0.5f + 1.0f, center.y - textSize.y * 0.5f),
-                        IM_COL32(255, 255, 255, 255), letter);
+        // Fallback: coloured circle with the first letter of the name
+        dl->AddCircleFilled(center, radius, IM_COL32(88, 101, 242, 255), 48);
+        std::string letter = FirstGlyph(DisplayName(user));
+        if (!letter.empty()) {
+            ImVec2 ts = ImGui::CalcTextSize(letter.c_str());
+            dl->AddText(ImVec2(center.x - ts.x * 0.5f + 1.0f, center.y - ts.y * 0.5f),
+                        IM_COL32(255, 255, 255, 255), letter.c_str());
         }
     }
 
-    // Speaking: green border
-    if (user.speaking) {
-        dl->AddCircle(center, iconRadius + 1.5f, IM_COL32(61, 199, 112, 255), 48, 2.5f);
-    }
+    if (user.speaking)
+        dl->AddCircle(center, radius + stroke * 0.6f, IM_COL32(61, 199, 112, 255), 48, stroke);
 
-    // Muted or deafened: red X through the icon
+    // Muted or deafened: X through the icon (orange for deafened, red for muted)
     if (user.mute || user.deaf) {
-        float xPad = iconRadius * 0.3f;
-        ImVec2 tl(pos.x + xPad, pos.y + xPad);
-        ImVec2 br(pos.x + iconSize - xPad, pos.y + iconSize - xPad);
+        float pad = radius * 0.3f;
+        ImVec2 tl(pos.x + pad, pos.y + pad);
+        ImVec2 br(pos.x + size - pad, pos.y + size - pad);
         ImU32 xCol = user.deaf ? IM_COL32(250, 168, 18, 255) : IM_COL32(237, 66, 66, 255);
-        dl->AddLine(tl, br, xCol, 2.5f);
-        dl->AddLine(ImVec2(br.x, tl.y), ImVec2(tl.x, br.y), xCol, 2.5f);
+        dl->AddLine(tl, br, xCol, stroke);
+        dl->AddLine(ImVec2(br.x, tl.y), ImVec2(tl.x, br.y), xCol, stroke);
     }
 
-    ImGui::Dummy(ImVec2(iconSize + 4, iconSize));
-    ImGui::SameLine(0, 4);
+    ImGui::Dummy(ImVec2(size + 4, size));
 }
 
-static void RenderChannelIcon(Texture_t* tex, float size) {
-    if (!tex || !tex->Resource) return;
-    ImVec2 pos = ImGui::GetCursorScreenPos();
-    ImGui::GetWindowDrawList()->AddImageRounded(
-        (ImTextureID)tex->Resource,
-        pos, ImVec2(pos.x + size, pos.y + size),
-        ImVec2(0, 0), ImVec2(1, 1),
-        IM_COL32(255, 255, 255, 255), 2.0f);
-    ImGui::Dummy(ImVec2(size, size));
-    ImGui::SameLine(0, 4);
+// One line of the overlay: avatar or dot, then optionally the name.
+static void RenderUserRow(const VoiceUser& user, Texture_t* tex) {
+    if (g_ShowAvatars) RenderUserAvatar(user, tex);
+    else               RenderUserDot(user);
+
+    if (!g_ShowNames && g_ShowAvatars) return;
+
+    if (g_ShowNames) {
+        ImGui::SameLine(0, 4);
+        if (g_ShowAvatars) {
+            // Vertically centre the text next to the avatar
+            float offset = (g_AvatarSize - ImGui::GetTextLineHeight()) * 0.5f;
+            if (offset > 0) ImGui::SetCursorPosY(ImGui::GetCursorPosY() + offset);
+        }
+        ImGui::TextColored(NameColor(user), "%s", DisplayName(user).c_str());
+    }
+
+    // Without avatars there is no X, so spell out the state
+    if (!g_ShowAvatars && (user.deaf || user.mute)) {
+        ImGui::SameLine();
+        if (user.deaf) ImGui::TextColored(ImVec4(0.98f, 0.66f, 0.07f, 1.0f), "[D]");
+        else           ImGui::TextColored(ImVec4(0.93f, 0.26f, 0.26f, 1.0f), "[M]");
+    }
 }
+
+static void RenderChannelHeader(Texture_t* tex, const std::string& channelName) {
+    float iconSize = ImGui::GetTextLineHeight();
+    if (tex && tex->Resource) {
+        ImVec2 pos = ImGui::GetCursorScreenPos();
+        ImGui::GetWindowDrawList()->AddImageRounded(
+            (ImTextureID)tex->Resource, pos, ImVec2(pos.x + iconSize, pos.y + iconSize),
+            ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, 255), 2.0f);
+        ImGui::Dummy(ImVec2(iconSize, iconSize));
+        ImGui::SameLine(0, 4);
+    }
+    ImGui::TextColored(ToVec4(g_ColChannel), "%s", channelName.c_str());
+}
+
+static bool IsMouseOver(ImVec2 pos, ImVec2 size) {
+    ImVec2 m = ImGui::GetMousePos();
+    return m.x >= pos.x && m.x <= pos.x + size.x && m.y >= pos.y && m.y <= pos.y + size.y;
+}
+
+// Pairs every Begin with End and every Push with a Pop, even if something
+// in between throws — an unbalanced ImGui stack would itself crash the game.
+struct OverlayWindowScope {
+    bool open;
+    explicit OverlayWindowScope(ImGuiWindowFlags flags) {
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ToVec4(g_ColBackground));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 6));
+        open = ImGui::Begin("##DiscordantOverlay", nullptr, flags);
+    }
+    ~OverlayWindowScope() {
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor(2);
+    }
+    OverlayWindowScope(const OverlayWindowScope&) = delete;
+    OverlayWindowScope& operator=(const OverlayWindowScope&) = delete;
+};
 
 static void RenderVoiceOverlay() {
-    // Single mutex lock for all shared voice state
+    OverlayState& ov = *g_Overlay;
     VoiceSnapshot snap = g_Discord->GetVoiceSnapshot();
-    auto& users = snap.users;
-    auto& channelName = snap.channelName;
+    const std::string& channelName = snap.channelName;
 
-    // Pre-resolve textures from cache (avoids per-user string concat in render loop)
-    Texture_t* chanIconTex = GetCachedChannelIconTexture(snap.channelIconId);
-    static std::vector<Texture_t*> s_userTextures;
-    s_userTextures.clear();
-    s_userTextures.reserve(users.size());
-    for (const auto& u : users) {
-        s_userTextures.push_back(GetCachedAvatarTexture(u));
+    // While the options panel is open, show everything so it can be positioned
+    bool optionsOpen = ImGui::GetFrameCount() - g_OptionsFrame <= 2;
+    bool inVoice = !snap.users.empty() || !channelName.empty();
+    bool showChannel = g_ShowChannelName && !channelName.empty();
+
+    ov.visibleUsers.clear();
+    for (auto& u : snap.users) {
+        if (!g_SpeakingOnly || optionsOpen || u.speaking)
+            ov.visibleUsers.push_back(std::move(u));
     }
+    const auto& users = ov.visibleUsers;
 
-    // Evict stale avatar cache entries for users no longer in channel
-    if (s_avatarCache.size() > users.size() + 8) {
-        std::unordered_map<std::string, AvatarCacheEntry> fresh;
-        for (const auto& u : users) {
-            if (!u.avatar.empty()) {
-                std::string key = u.id + ":" + u.avatar;
-                auto it = s_avatarCache.find(key);
-                if (it != s_avatarCache.end()) fresh[key] = it->second;
-            }
-        }
-        s_avatarCache.swap(fresh);
-    }
+    bool showPreview = !inVoice && (optionsOpen || (!g_LockPosition && !g_HideWhenNotInVoice));
+    if (!showPreview && users.empty() && !showChannel) return;  // nothing to show
 
-    bool hasContent = !users.empty() || !channelName.empty();
-    if (!hasContent && g_LockPosition) return;  // Nothing to show and locked — hide
+    // Resolve textures before drawing
+    Texture_t* chanIconTex = showChannel ? GetChannelIconTexture(snap.channelIconId) : nullptr;
+    ov.userTextures.clear();
+    for (const auto& u : users)
+        ov.userTextures.push_back(g_ShowAvatars ? GetAvatarTexture(u) : nullptr);
 
     // Hide-on-hover: when locked and hovered, hide for 5 seconds
-    static ULONGLONG s_hideUntil = 0;
-    static bool s_wasHovered = false;
-    static ImVec2 s_lastPos(0, 0);
-    static ImVec2 s_lastSize(0, 0);
-    if (g_HideOnHover && g_LockPosition && GetTickCount64() < s_hideUntil) {
-        // Check if mouse is still over where the overlay was — restart timer
-        ImVec2 mouse = ImGui::GetMousePos();
-        bool stillOver = mouse.x >= s_lastPos.x && mouse.x <= s_lastPos.x + s_lastSize.x &&
-                         mouse.y >= s_lastPos.y && mouse.y <= s_lastPos.y + s_lastSize.y;
-        if (stillOver) {
-            s_hideUntil = GetTickCount64() + 5000;
-        }
-        return;  // Still hidden
+    if (g_HideOnHover && g_LockPosition && !optionsOpen && GetTickCount64() < ov.hideUntil) {
+        if (IsMouseOver(ov.lastPos, ov.lastSize))
+            ov.hideUntil = GetTickCount64() + 5000;  // still over it: keep hidden
+        return;
     }
 
-    ImVec4 colBg(0.12f, 0.13f, 0.15f, g_OverlayAlpha);
-    ImVec4 colHeader(g_ColChannel[0], g_ColChannel[1], g_ColChannel[2], g_ColChannel[3]);
-
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, colBg);
-    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 6));
-
-    ImGuiWindowFlags overlayFlags =
+    ImGuiWindowFlags flags =
         ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoScrollbar |
         ImGuiWindowFlags_AlwaysAutoResize |
         ImGuiWindowFlags_NoFocusOnAppearing |
         ImGuiWindowFlags_NoBringToFrontOnFocus;
-    if (g_LockPosition) {
-        overlayFlags |= ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoMouseInputs;
+    if (g_LockPosition)
+        flags |= ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoMouseInputs;
+
+    // Restore the saved position once, the first time the overlay is shown
+    ImVec2 display = ImGui::GetIO().DisplaySize;
+    if (!ov.posApplied) {
+        ov.posApplied = true;
+        if (g_HasPos) {
+            float x = g_PosX, y = g_PosY;
+            if (display.x > 0 && display.y > 0) {  // keep it on screen after a resolution change
+                x = std::clamp(x, 0.0f, std::max(0.0f, display.x - 40.0f));
+                y = g_GrowUpward ? std::clamp(y, 40.0f, display.y)
+                                 : std::clamp(y, 0.0f, std::max(0.0f, display.y - 40.0f));
+            }
+            if (g_GrowUpward) {
+                ov.anchorBottom = y;
+                ov.anchorSet = true;
+                y -= 40.0f;  // corrected to the real height once it is known
+            }
+            ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_Always);
+        }
     }
 
-    // When growing upward, anchor the bottom edge of the window
-    static float s_anchorBottom = -1.0f;
-    static bool s_anchorSet = false;
-    if (g_GrowUpward && s_anchorSet) {
-        ImGui::SetNextWindowSizeConstraints(ImVec2(160, 40), ImVec2(300, 600));
+    float minWidth = g_ShowNames ? 160.0f : 0.0f;
+    float maxWidth = std::max(300.0f, 300.0f * g_OverlayScale);
+    float maxHeight = display.y > 0 ? display.y : 2000.0f;
+    ImGui::SetNextWindowSizeConstraints(ImVec2(minWidth, 0), ImVec2(maxWidth, maxHeight));
+
+    OverlayWindowScope window(flags);
+    if (!window.open) return;
+
+    ImGui::SetWindowFontScale(g_OverlayScale);
+
+    // Remember the window rect for hide-on-hover (NoMouseInputs blocks ImGui hover)
+    ov.lastPos = ImGui::GetWindowPos();
+    ov.lastSize = ImGui::GetWindowSize();
+    if (g_HideOnHover && g_LockPosition && !optionsOpen) {
+        bool hovered = IsMouseOver(ov.lastPos, ov.lastSize);
+        if (hovered && !ov.wasHovered)
+            ov.hideUntil = GetTickCount64() + 5000;
+        ov.wasHovered = hovered;
+    }
+
+    if (showPreview) {
+        if (g_ShowChannelName) {
+            ImGui::TextColored(ToVec4(g_ColChannel), "Voice Channel");
+            ImGui::Separator();
+        }
+        // Dummy users to preview size, colour and avatar settings
+        VoiceUser dummies[3];
+        dummies[0].username = "UserSpeaking";
+        dummies[0].speaking = true;
+        dummies[1].username = "UserSilent";
+        dummies[2].username = "UserMuted";
+        dummies[2].mute = true;
+        for (const auto& d : dummies)
+            RenderUserRow(d, nullptr);
+        ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f),
+                           g_LockPosition ? "Preview (unlock to move)" : "Drag to reposition");
+    }
+
+    if (showChannel && !g_GrowUpward) {
+        RenderChannelHeader(chanIconTex, channelName);
+        ImGui::Separator();
+    }
+
+    // Render users in reverse order when growing upward
+    int userCount = (int)users.size();
+    for (int i = 0; i < userCount; i++) {
+        int idx = g_GrowUpward ? (userCount - 1 - i) : i;
+        RenderUserRow(users[idx], ov.userTextures[idx]);
+    }
+
+    if (showChannel && g_GrowUpward) {
+        ImGui::Separator();
+        RenderChannelHeader(chanIconTex, channelName);
+    }
+
+    // Keep the bottom edge fixed when growing upward
+    ImVec2 winPos = ImGui::GetWindowPos();
+    float winH = ImGui::GetWindowSize().y;
+    if (g_GrowUpward) {
+        if (!ov.anchorSet) {
+            ov.anchorBottom = winPos.y + winH;
+            ov.anchorSet = true;
+        } else if (!g_LockPosition && ImGui::IsWindowFocused() && ImGui::IsMouseDragging(0)) {
+            ov.anchorBottom = winPos.y + winH;  // user is dragging it
+        } else if (winPos.y != ov.anchorBottom - winH) {
+            ImGui::SetWindowPos(ImVec2(winPos.x, ov.anchorBottom - winH));
+        }
     } else {
-        ImGui::SetNextWindowSizeConstraints(ImVec2(160, 40), ImVec2(300, 600));
+        ov.anchorSet = false;
     }
-    if (ImGui::Begin("##DiscordantOverlay", nullptr, overlayFlags))
-    {
-        ImGui::SetWindowFontScale(g_OverlayScale);
 
-        // Manual hover detection (NoMouseInputs blocks ImGui hover)
-        // Save window rect for use when hidden
-        s_lastPos = ImGui::GetWindowPos();
-        s_lastSize = ImGui::GetWindowSize();
-        if (g_HideOnHover && g_LockPosition) {
-            ImVec2 mouse = ImGui::GetMousePos();
-            bool hovered = mouse.x >= s_lastPos.x && mouse.x <= s_lastPos.x + s_lastSize.x &&
-                           mouse.y >= s_lastPos.y && mouse.y <= s_lastPos.y + s_lastSize.y;
-            if (hovered && !s_wasHovered) {
-                s_hideUntil = GetTickCount64() + 5000;
-            }
-            s_wasHovered = hovered;
-        }
-        if (!hasContent) {
-            if (g_ShowChannelName) {
-                ImGui::TextColored(colHeader, "Voice Channel");
-                ImGui::Separator();
-            }
-            // Dummy users to preview font size, color, and avatar settings
-            VoiceUser dummies[3];
-            dummies[0].username = "UserSpeaking";
-            dummies[0].speaking = true;
-            dummies[1].username = "UserSilent";
-            dummies[2].username = "UserMuted";
-            dummies[2].mute = true;
-            for (int i = 0; i < 3; i++) {
-                if (g_ShowAvatars) {
-                    // Fallback avatar (no real texture)
-                    float iconSize = 24.0f;
-                    float iconRadius = iconSize * 0.5f;
-                    ImVec2 pos = ImGui::GetCursorScreenPos();
-                    ImVec2 center(pos.x + iconRadius, pos.y + iconRadius);
-                    ImDrawList* dl = ImGui::GetWindowDrawList();
-                    dl->AddCircleFilled(center, iconRadius, IM_COL32(88, 101, 242, 255), 48);
-                    char letter[2] = { dummies[i].username[0], 0 };
-                    ImVec2 ts = ImGui::CalcTextSize(letter);
-                    dl->AddText(ImVec2(center.x - ts.x * 0.5f + 1.0f, center.y - ts.y * 0.5f), IM_COL32(255,255,255,255), letter);
-                    if (dummies[i].speaking)
-                        dl->AddCircle(center, iconRadius + 1.5f, IM_COL32(61, 199, 112, 255), 48, 2.5f);
-                    if (dummies[i].mute)  {
-                        float xPad = iconRadius * 0.3f;
-                        dl->AddLine(ImVec2(pos.x+xPad, pos.y+xPad), ImVec2(pos.x+iconSize-xPad, pos.y+iconSize-xPad), IM_COL32(237,66,66,255), 2.5f);
-                        dl->AddLine(ImVec2(pos.x+iconSize-xPad, pos.y+xPad), ImVec2(pos.x+xPad, pos.y+iconSize-xPad), IM_COL32(237,66,66,255), 2.5f);
-                    }
-                    ImGui::Dummy(ImVec2(iconSize + 4, iconSize));
-                    ImGui::SameLine(0, 4);
-                } else {
-                    RenderUserDot(dummies[i]);
-                }
-                ImVec4 nc;
-                if (dummies[i].mute)          nc = ImVec4(g_ColMuted[0], g_ColMuted[1], g_ColMuted[2], g_ColMuted[3]);
-                else if (dummies[i].speaking) nc = ImVec4(g_ColSpeaking[0], g_ColSpeaking[1], g_ColSpeaking[2], g_ColSpeaking[3]);
-                else                          nc = ImVec4(g_ColSilent[0], g_ColSilent[1], g_ColSilent[2], g_ColSilent[3]);
-                ImGui::TextColored(nc, "%s", dummies[i].username.c_str());
-            }
-            ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f), "Drag to reposition");
-        }
-
-        if (g_ShowChannelName && !channelName.empty() && !g_GrowUpward) {
-            float iconSize = ImGui::GetTextLineHeight();
-            RenderChannelIcon(chanIconTex, iconSize);
-            ImGui::TextColored(colHeader, "%s", channelName.c_str());
-            ImGui::Separator();
-        }
-
-        // Render users in reverse order when growing upward
-        int userCount = (int)users.size();
-        for (int ui = 0; ui < userCount; ui++) {
-            int idx = g_GrowUpward ? (userCount - 1 - ui) : ui;
-            const auto& user = users[idx];
-            if (g_ShowAvatars) {
-                RenderUserAvatar(user, s_userTextures[idx]);
-            } else {
-                RenderUserDot(user);
-            }
-
-            std::string displayName = user.nick.empty() ? user.username : user.nick;
-            ImVec4 nameColor;
-            if (user.deaf || user.mute) nameColor = ImVec4(g_ColMuted[0], g_ColMuted[1], g_ColMuted[2], g_ColMuted[3]);
-            else if (user.speaking)     nameColor = ImVec4(g_ColSpeaking[0], g_ColSpeaking[1], g_ColSpeaking[2], g_ColSpeaking[3]);
-            else                        nameColor = ImVec4(g_ColSilent[0], g_ColSilent[1], g_ColSilent[2], g_ColSilent[3]);
-
-            if (g_ShowAvatars) {
-                // Vertically center text next to avatar
-                float offset = (24.0f - ImGui::GetTextLineHeight()) * 0.5f;
-                if (offset > 0) ImGui::SetCursorPosY(ImGui::GetCursorPosY() + offset);
-            }
-
-            ImGui::TextColored(nameColor, "%s", displayName.c_str());
-
-            if (!g_ShowAvatars) {
-                ImGui::SameLine();
-                if (user.deaf) {
-                    ImGui::TextColored(ImVec4(0.98f, 0.66f, 0.07f, 1.0f), "[D]");
-                } else if (user.mute) {
-                    ImGui::TextColored(ImVec4(0.93f, 0.26f, 0.26f, 1.0f), "[M]");
-                }
-            }
-        }
-
-        if (g_ShowChannelName && !channelName.empty() && g_GrowUpward) {
-            ImGui::Separator();
-            float iconSize = ImGui::GetTextLineHeight();
-            RenderChannelIcon(chanIconTex, iconSize);
-            ImGui::TextColored(colHeader, "%s", channelName.c_str());
-        }
-
-        // Anchor bottom edge when growing upward
-        if (g_GrowUpward) {
-            ImVec2 winPos = ImGui::GetWindowPos();
-            float winH = ImGui::GetWindowSize().y;
-            if (!s_anchorSet) {
-                s_anchorBottom = winPos.y + winH;
-                s_anchorSet = true;
-            } else {
-                // If user dragged the window, update anchor
-                if (!g_LockPosition && ImGui::IsWindowFocused() && ImGui::IsMouseDragging(0)) {
-                    s_anchorBottom = winPos.y + winH;
-                } else {
-                    float newY = s_anchorBottom - winH;
-                    if (newY != winPos.y) {
-                        ImGui::SetWindowPos(ImVec2(winPos.x, newY));
-                    }
-                }
-            }
-        } else {
-            s_anchorSet = false;
+    // Save the position once it settles (after a drag, or a direction change).
+    // The first frames are skipped: an auto-sized window has no real size yet.
+    if (++ov.framesShown > 3 && !ImGui::IsMouseDown(0)) {
+        float x = winPos.x;
+        float y = g_GrowUpward ? ov.anchorBottom : winPos.y;
+        if (!g_HasPos || std::fabs(x - g_PosX) > 0.5f || std::fabs(y - g_PosY) > 0.5f) {
+            g_PosX = x;
+            g_PosY = y;
+            g_HasPos = true;
+            MarkConfigDirty();
         }
     }
-    ImGui::End();
-
-    ImGui::PopStyleVar(2);
-    ImGui::PopStyleColor(2);
 }
 
 // --- Addon Lifecycle ---
+
+static void DestroyAll() {
+    if (g_MumbleSubscribed) {
+        APIDefs->Events_Unsubscribe(EV_MUMBLE_IDENTITY_UPDATED, OnMumbleIdentityUpdated);
+        g_MumbleSubscribed = false;
+    }
+    if (g_RichPresence) {
+        g_RichPresence->Shutdown();  // queues a presence clear, sent as IPC stops
+        delete g_RichPresence;
+        g_RichPresence = nullptr;
+    }
+    if (g_DiscordIPC) {
+        g_DiscordIPC->Stop();
+        delete g_DiscordIPC;
+        g_DiscordIPC = nullptr;
+    }
+    if (g_Discord) {
+        g_Discord->Disconnect();
+        delete g_Discord;
+        g_Discord = nullptr;
+    }
+    delete g_Overlay;
+    g_Overlay = nullptr;
+}
 
 void AddonLoad(AddonAPI_t* aApi) {
     APIDefs = aApi;
@@ -511,81 +608,94 @@ void AddonLoad(AddonAPI_t* aApi) {
     ImGui::SetAllocatorFunctions((void* (*)(size_t, void*))APIDefs->ImguiMalloc,
                                  (void(*)(void*, void*))APIDefs->ImguiFree);
 
-    // Allocate Discord client on heap (not as global to avoid DllMain issues)
-    g_Discord = new DiscordClient();
-    g_DiscordIPC = new DiscordIPC();
-    g_DiscordIPC->Start(GetEffectiveAppId());
-    g_RichPresence = new RichPresence(g_DiscordIPC);
-    g_MumbleLink = (Mumble::Data*)APIDefs->DataLink_Get(DL_MUMBLE_LINK);
-    APIDefs->Events_Subscribe(EV_MUMBLE_IDENTITY_UPDATED, OnMumbleIdentityUpdated);
+    try {
+        const char* addonDir = APIDefs->Paths_GetAddonDirectory("Discordant");
+        if (addonDir) {
+            snprintf(g_ConfigPath, MAX_PATH, "%s\\config.json", addonDir);
+            CreateDirectoryA(addonDir, NULL);
+        }
 
-    // Set up config path
-    const char* addonDir = APIDefs->Paths_GetAddonDirectory("Discordant");
-    if (addonDir) {
-        snprintf(g_ConfigPath, MAX_PATH, "%s\\config.json", addonDir);
-        CreateDirectoryA(addonDir, NULL);
+        // Heap-allocated, not globals, to keep construction out of DllMain
+        g_Overlay = new OverlayState();
+        g_Discord = new DiscordClient();
+        LoadConfig();  // before starting anything, so saved settings apply from the start
+
+        g_DiscordIPC = new DiscordIPC();
+        g_DiscordIPC->Start(GetEffectiveAppId());
+        g_RichPresence = new RichPresence(g_DiscordIPC);
+        g_MumbleLink = (Mumble::Data*)APIDefs->DataLink_Get(DL_MUMBLE_LINK);
+        APIDefs->Events_Subscribe(EV_MUMBLE_IDENTITY_UPDATED, OnMumbleIdentityUpdated);
+        g_MumbleSubscribed = true;
+
+        g_Discord->Connect();
+    } catch (const std::exception& e) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Failed to start: %s", e.what());
+        Log(LOGL_CRITICAL, msg);
+        try { DestroyAll(); } catch (...) {}
+        return;
+    } catch (...) {
+        Log(LOGL_CRITICAL, "Failed to start");
+        try { DestroyAll(); } catch (...) {}
+        return;
     }
 
-    // Load saved access token
-    LoadConfig();
-
-    // Start Discord connection
-    g_Discord->Connect();
-    APIDefs->Log(LOGL_INFO, "Discordant", "Connect() called");
-
-    // Register render functions
     APIDefs->GUI_Register(RT_Render, AddonRender);
     APIDefs->GUI_Register(RT_OptionsRender, AddonOptions);
-
-    APIDefs->Log(LOGL_INFO, "Discordant", "Addon loaded");
+    Log(LOGL_INFO, "Addon loaded");
 }
 
 void AddonUnload() {
     // Stop Nexus calling into us before anything is torn down
     APIDefs->GUI_Deregister(AddonOptions);
     APIDefs->GUI_Deregister(AddonRender);
-    APIDefs->Events_Unsubscribe(EV_MUMBLE_IDENTITY_UPDATED, OnMumbleIdentityUpdated);
 
-    SaveConfig();
-    g_MumbleLink = nullptr;
-
-    if (g_RichPresence) {
-        g_RichPresence->Shutdown();
-        delete g_RichPresence;
-        g_RichPresence = nullptr;
-    }
-
-    if (g_DiscordIPC) {
-        g_DiscordIPC->Stop();
-        delete g_DiscordIPC;
-        g_DiscordIPC = nullptr;
-    }
-
-    if (g_Discord) {
-        g_Discord->Disconnect();
-        delete g_Discord;
-        g_Discord = nullptr;
-    }
+    try {
+        if (g_Discord) SaveConfig();
+        g_MumbleLink = nullptr;
+        DestroyAll();
+    } catch (...) {}
 
     APIDefs = nullptr;
 }
 
-// --- Main Render ---
+// Report an error caught at the Nexus boundary. Limited to a few lines so a
+// recurring error cannot flood the log.
+static void ReportCaughtError(const char* where, const char* what) {
+    static int s_reported = 0;
+    if (s_reported >= 5) return;
+    s_reported++;
+    char msg[512];
+    snprintf(msg, sizeof(msg), "Error in %s (handled, game unaffected): %s%s",
+             where, what ? what : "unknown",
+             s_reported == 5 ? " — further errors will not be logged" : "");
+    Log(LOGL_WARNING, msg);
+}
 
-void AddonRender() {
-    if (!g_Discord) return;
+static void DrainLogs() {
+    for (const auto& msg : g_Discord->DrainLogQueue())
+        APIDefs->Log(LOGL_INFO, "Discordant", msg.c_str());
+    if (g_DiscordIPC)
+        for (const auto& msg : g_DiscordIPC->DrainLogQueue())
+            APIDefs->Log(LOGL_INFO, "Discordant/IPC", msg.c_str());
+    if (g_RichPresence)
+        for (const auto& msg : g_RichPresence->DrainLogQueue())
+            APIDefs->Log(LOGL_INFO, "Discordant/RP", msg.c_str());
+}
+
+static void RenderFrame() {
+    if (!g_Discord || !g_Overlay) return;
 
     if (g_RichPresence) {
         RPGameState rpState;
-        rpState.inGame     = g_MumbleLink && g_MumbleLink->UITick > 0
-                             && g_MumbleIdentity.Name[0] != '\0';
+        rpState.inGame = g_MumbleLink && g_MumbleLink->UITick > 0
+                         && g_MumbleIdentity.Name[0] != '\0';
         // Name is a fixed 20-byte field with no guarantee of a terminator
-        rpState.charName        = std::string(g_MumbleIdentity.Name,
-                                              strnlen(g_MumbleIdentity.Name,
-                                                      sizeof(g_MumbleIdentity.Name)));
-        rpState.mapId           = g_MumbleIdentity.MapID;
-        rpState.profession      = static_cast<unsigned>(g_MumbleIdentity.Profession);
-        rpState.specialization  = g_MumbleIdentity.Specialization;
+        rpState.charName = std::string(g_MumbleIdentity.Name,
+                                       strnlen(g_MumbleIdentity.Name, sizeof(g_MumbleIdentity.Name)));
+        rpState.mapId          = g_MumbleIdentity.MapID;
+        rpState.profession     = static_cast<unsigned>(g_MumbleIdentity.Profession);
+        rpState.specialization = g_MumbleIdentity.Specialization;
         g_RichPresence->Update(rpState, g_RPConfig);
     }
 
@@ -593,121 +703,147 @@ void AddonRender() {
     static int s_logFrameCount = 0;
     if (++s_logFrameCount >= 30) {
         s_logFrameCount = 0;
-        for (const auto& msg : g_Discord->DrainLogQueue())
-            APIDefs->Log(LOGL_INFO, "Discordant", msg.c_str());
-        if (g_DiscordIPC) {
-            for (const auto& msg : g_DiscordIPC->DrainLogQueue())
-                APIDefs->Log(LOGL_INFO, "Discordant/IPC", msg.c_str());
-        }
-        if (g_RichPresence) {
-            for (const auto& msg : g_RichPresence->DrainLogQueue())
-                APIDefs->Log(LOGL_INFO, "Discordant/RP", msg.c_str());
-        }
+        DrainLogs();
     }
 
-    // Save token when we first get one
-    static std::string s_lastSavedToken;
-    std::string currentToken = g_Discord->GetAccessToken();
-    if (!currentToken.empty() && currentToken != s_lastSavedToken) {
+    // Save when the network thread obtains (or discards) a sign-in token,
+    // or shortly after a settings change.
+    static uint32_t s_savedTokenGen = 0;
+    uint32_t tokenGen = g_Discord->GetTokenGeneration();
+    if (tokenGen != s_savedTokenGen) {
+        s_savedTokenGen = tokenGen;
         SaveConfig();
-        s_lastSavedToken = currentToken;
+    } else if (g_ConfigDirty && GetTickCount64() - g_ConfigDirtyAt > 500) {
+        SaveConfig();
     }
 
-    if (g_Discord->GetState() == DiscordState::Connected) {
+    if (g_Discord->GetState() == DiscordState::Connected)
         RenderVoiceOverlay();
+}
+
+// Nexus calls these from the game's render thread. A C++ exception escaping
+// here terminates Guild Wars 2, so nothing is allowed through.
+void AddonRender() {
+    try {
+        RenderFrame();
+    } catch (const std::exception& e) {
+        ReportCaughtError("render", e.what());
+    } catch (...) {
+        ReportCaughtError("render", nullptr);
     }
 }
 
-// --- Options Panel ---
-
-void AddonOptions() {
+static void OptionsPanel() {
     if (!g_Discord) return;
+    g_OptionsFrame = ImGui::GetFrameCount();
+
     ImGui::Text("Discordant - Discord Voice Overlay");
-    if (ImGui::SmallButton("Homepage")) {
+    if (ImGui::SmallButton("Homepage"))
         ShellExecuteA(NULL, "open", "https://pie.rocks.cc/", NULL, NULL, SW_SHOWNORMAL);
-    }
     ImGui::SameLine();
-    if (ImGui::SmallButton("Buy me a coffee!")) {
+    if (ImGui::SmallButton("Buy me a coffee!"))
         ShellExecuteA(NULL, "open", "https://ko-fi.com/pieorcake", NULL, NULL, SW_SHOWNORMAL);
-    }
     ImGui::Spacing();
 
     DiscordState state = g_Discord->GetState();
     ImVec4 statusColor(0.98f, 0.66f, 0.07f, 1.0f);
-    if (state == DiscordState::Connected)    statusColor = ImVec4(0.24f, 0.78f, 0.44f, 1.0f);
+    if (state == DiscordState::Connected)         statusColor = ImVec4(0.24f, 0.78f, 0.44f, 1.0f);
     else if (state == DiscordState::Disconnected) statusColor = ImVec4(0.93f, 0.26f, 0.26f, 1.0f);
     ImGui::TextColored(statusColor, "Status: %s", g_Discord->GetStatusText().c_str());
 
     ImGui::Spacing();
-    if (ImGui::Checkbox("Show user avatars", &g_ShowAvatars)) SaveConfig();
-    if (ImGui::Checkbox("Show channel name", &g_ShowChannelName)) SaveConfig();
-    if (ImGui::Checkbox("Lock overlay position", &g_LockPosition)) SaveConfig();
-    if (ImGui::Checkbox("Hide overlay on mouseover (5s)", &g_HideOnHover)) SaveConfig();
-    ImGui::Text("List grow direction");
-    if (ImGui::RadioButton("Downward", !g_GrowUpward)) { g_GrowUpward = false; SaveConfig(); }
-    ImGui::SameLine();
-    if (ImGui::RadioButton("Upward", g_GrowUpward)) { g_GrowUpward = true; SaveConfig(); }
+    ImGui::Text("The voice overlay appears automatically when in a Discord voice channel.");
+    ImGui::TextDisabled("While this panel is open the overlay is always shown, so you can position it.");
     ImGui::Spacing();
-    ImGui::Text("Overlay transparency");
-    int alphaPct = (int)(g_OverlayAlpha * 100.0f + 0.5f);
-    if (ImGui::SliderInt("##alpha", &alphaPct, 10, 100, "%d%%")) {
-        g_OverlayAlpha = alphaPct / 100.0f;
-        SaveConfig();
+
+    bool changed = false;
+    changed |= ImGui::Checkbox("Show user avatars", &g_ShowAvatars);
+    if (g_ShowAvatars) {
+        ImGui::Indent();
+        int size = (int)(g_AvatarSize + 0.5f);
+        ImGui::SetNextItemWidth(200.0f);
+        if (ImGui::SliderInt("Avatar size", &size, (int)AVATAR_SIZE_MIN, (int)AVATAR_SIZE_MAX, "%d px")) {
+            g_AvatarSize = (float)size;
+            changed = true;
+        }
+        ImGui::Unindent();
     }
+    changed |= ImGui::Checkbox("Show names", &g_ShowNames);
+    changed |= ImGui::Checkbox("Show channel name", &g_ShowChannelName);
+    changed |= ImGui::Checkbox("Only show people who are speaking", &g_SpeakingOnly);
+    changed |= ImGui::Checkbox("Hide when not in a voice channel", &g_HideWhenNotInVoice);
+    changed |= ImGui::Checkbox("Lock overlay position", &g_LockPosition);
+    changed |= ImGui::Checkbox("Hide overlay on mouseover (5s)", &g_HideOnHover);
+
+    ImGui::Text("List grow direction");
+    if (ImGui::RadioButton("Downward", !g_GrowUpward)) { g_GrowUpward = false; changed = true; }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Upward", g_GrowUpward)) { g_GrowUpward = true; changed = true; }
+
     ImGui::Text("Font scale");
     int scalePct = (int)(g_OverlayScale * 100.0f + 0.5f);
+    ImGui::SetNextItemWidth(200.0f);
     if (ImGui::SliderInt("##scale", &scalePct, 50, 200, "%d%%")) {
         g_OverlayScale = scalePct / 100.0f;
-        SaveConfig();
+        changed = true;
     }
+
     ImGui::Text("Colours");
-    if (ImGui::ColorEdit4("Speaking##col", g_ColSpeaking, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar)) SaveConfig();
-    if (ImGui::ColorEdit4("Silent##col", g_ColSilent, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar)) SaveConfig();
-    if (ImGui::ColorEdit4("Muted##col", g_ColMuted, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar)) SaveConfig();
-    if (ImGui::ColorEdit4("Channel name##col", g_ColChannel, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar)) SaveConfig();
+    const ImGuiColorEditFlags colFlags = ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar;
+    changed |= ImGui::ColorEdit4("Background##col", g_ColBackground, colFlags);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Set the alpha (A) to 0 for a fully transparent background.");
+    changed |= ImGui::ColorEdit4("Speaking##col", g_ColSpeaking, colFlags);
+    changed |= ImGui::ColorEdit4("Silent##col", g_ColSilent, colFlags);
+    changed |= ImGui::ColorEdit4("Muted##col", g_ColMuted, colFlags);
+    changed |= ImGui::ColorEdit4("Channel name##col", g_ColChannel, colFlags);
 
     ImGui::Separator();
     ImGui::Text("Rich Presence");
     ImGui::Spacing();
 
-    if (ImGui::Checkbox("Enable Rich Presence", &g_RPConfig.enabled)) SaveConfig();
-
+    changed |= ImGui::Checkbox("Enable Rich Presence", &g_RPConfig.enabled);
     if (g_RPConfig.enabled) {
         ImGui::Indent();
-
         ImGui::SetNextItemWidth(200.0f);
-        if (ImGui::InputText("Application ID", g_RPAppIdOverride, sizeof(g_RPAppIdOverride)))
-            SaveConfig();
+        ImGui::InputText("Application ID", g_RPAppIdOverride, sizeof(g_RPAppIdOverride),
+                         ImGuiInputTextFlags_CharsDecimal);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Your Discord Application ID. Leave blank to use the built-in ID. Changes take effect immediately.");
-
-        if (ImGui::Checkbox("Show character name", &g_RPConfig.showCharName)) SaveConfig();
-        if (ImGui::Checkbox("Show current map",    &g_RPConfig.showMap))      SaveConfig();
-        if (ImGui::Checkbox("Show profession",     &g_RPConfig.showProfession)) SaveConfig();
-
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.5f);
-        ImGui::PopStyleVar();
-
+            ImGui::SetTooltip("Your Discord Application ID. Leave blank to use the built-in ID.");
+        // Apply when editing finishes, not on every keystroke (each change reconnects)
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            if (g_DiscordIPC) g_DiscordIPC->SetAppId(GetEffectiveAppId());
+            changed = true;
+        }
+        changed |= ImGui::Checkbox("Show character name", &g_RPConfig.showCharName);
+        changed |= ImGui::Checkbox("Show current map",    &g_RPConfig.showMap);
+        changed |= ImGui::Checkbox("Show profession",     &g_RPConfig.showProfession);
         ImGui::Unindent();
     }
 
-    ImGui::Spacing();
-    ImGui::Text("The voice overlay appears automatically when in a Discord voice channel.");
+    if (changed) MarkConfigDirty();
 
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
 
     if (state == DiscordState::Disconnected) {
-        if (ImGui::Button("Connect to Discord")) {
+        if (ImGui::Button("Connect to Discord"))
             g_Discord->Connect();
-        }
     } else {
-        if (ImGui::Button("Disconnect from Discord")) {
+        if (ImGui::Button("Disconnect from Discord"))
             g_Discord->Disconnect();
-        }
     }
+}
 
+void AddonOptions() {
+    try {
+        OptionsPanel();
+    } catch (const std::exception& e) {
+        ReportCaughtError("options", e.what());
+    } catch (...) {
+        ReportCaughtError("options", nullptr);
+    }
 }
 
 // --- Export: GetAddonDef ---

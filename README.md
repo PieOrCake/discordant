@@ -24,6 +24,8 @@ On first use, Discord will show a one-time authorization prompt. After that, the
 - **Speaking indicator** — green dot when someone is talking
 - **Mute/deaf status** — red `[M]` for muted, yellow `[D]` for deafened
 - **Auto-follow** — automatically tracks when you switch voice channels
+- **Customisable** — avatar size, font size, colours (including a fully transparent background), show only who's speaking, hide names, hide when not in voice, grow up or down
+- **Remembers its position** between game sessions
 - **Lightweight** — no external processes, no bot, just a single DLL
 
 ### Rich Presence
@@ -82,9 +84,8 @@ This produces `Discordant.dll`.
 
 ## Usage
 
-- **CTRL+SHIFT+D** — toggle the status/settings window
 - The voice overlay appears automatically when you're in a Discord voice channel
-- Quick Access shortcut is added to the Nexus toolbar
+- Settings are in the Nexus options panel; the overlay stays visible while it's open so you can position it
 
 ## Project Structure
 
