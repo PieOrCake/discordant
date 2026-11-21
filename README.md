@@ -25,8 +25,19 @@ On first use, Discord will show a one-time authorization prompt. After that, the
 - **Mute/deaf status** — red `[M]` for muted, yellow `[D]` for deafened
 - **Auto-follow** — automatically tracks when you switch voice channels
 - **Customisable** — avatar size, font size, colours (including a fully transparent background), show only who's speaking, hide names, hide when not in voice, grow up or down
+- **GW2 names** — optionally show players' GW2 account or character names instead of their Discord names (see below)
 - **Remembers its position** between game sessions
 - **Lightweight** — no external processes, no bot, just a single DLL
+
+### GW2 Names
+
+The overlay can show each person's GW2 account name or current character name instead of their Discord name. A player is recognised when:
+
+- their Discord server nickname (or display name) contains their account name, including the digits — e.g. `[TAG] Name.1234`
+- you link them by hand in the options panel (saved between sessions), picking from your current party or squad
+- it's you
+
+Character names, and picking players to link, need squad data from at least one of these optional addons: [RealTime API](https://raidcore.gg/gw2/addons/rtapi), or ArcDPS / Unofficial Extras through Raidcore's ArcDPS Integration. Discordant uses whichever of them are running, and the options panel shows which are delivering data. Anyone who can't be identified keeps their Discord name; a recognised player outside your group shows their account name.
 
 ### Rich Presence
 
@@ -95,13 +106,15 @@ discordant/
 ├── Discordant.def          # DLL export definition
 ├── include/
 │   ├── nexus/Nexus.h       # Raidcore Nexus API header
-│   └── mumble/Mumble.h     # MumbleLink structs
+│   ├── mumble/Mumble.h     # MumbleLink structs
+│   └── rtapi/RTAPI.hpp     # RealTime API header
 ├── src/
 │   ├── dllmain.cpp         # Addon entry point, ImGui overlay, Nexus integration
 │   ├── DiscordClient.h/cpp # Discord RPC auth flow, voice event handling
 │   ├── WebSocket.h/cpp     # Minimal WebSocket client (Winsock2)
 │   ├── DiscordIPC.h/cpp    # Named pipe IPC client for Rich Presence
 │   ├── RichPresence.h/cpp  # MumbleLink → Discord activity updates
+│   ├── Gw2Roster.h/cpp     # Squad/party names from RTAPI, ArcDPS, Unofficial Extras
 │   └── MapData.h           # GW2 map ID → name lookup table
 ├── scripts/
 │   └── setup.sh            # Dependency download script
@@ -117,6 +130,7 @@ MIT License
 - [Dear ImGui](https://github.com/ocornut/imgui) — MIT License, Copyright (c) 2014-2021 Omar Cornut
 - [nlohmann/json](https://github.com/nlohmann/json) — MIT License, Copyright (c) 2013-2025 Niels Lohmann
 - [Nexus API](https://raidcore.gg/Nexus) — MIT License, Copyright (c) Raidcore.GG
+- [RealTime API header](https://github.com/RaidcoreGG/GW2-RealTime-API-Releases) — MIT License, Copyright (c) Raidcore
 
 ## Acknowledgements
 

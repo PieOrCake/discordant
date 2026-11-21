@@ -49,6 +49,7 @@ set(SOURCES
     src/WebSocket.cpp
     src/RichPresence.cpp
     src/DiscordIPC.cpp
+    src/Gw2Roster.cpp
     ${IMGUI_SOURCES}
 )
 

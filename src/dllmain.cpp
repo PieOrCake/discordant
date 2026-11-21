@@ -17,6 +17,7 @@
 #include "DiscordClient.h"
 #include "RichPresence.h"
 #include "DiscordIPC.h"
+#include "Gw2Roster.h"
 
 // Version constants
 #define V_MAJOR 0
@@ -45,6 +46,11 @@ float g_ColSpeaking[4]   = {0.90f, 0.90f, 0.90f, 1.0f};
 float g_ColSilent[4]     = {0.55f, 0.55f, 0.55f, 1.0f};
 float g_ColMuted[4]      = {0.93f, 0.26f, 0.26f, 1.0f};
 float g_ColChannel[4]    = {0.34f, 0.40f, 0.96f, 1.0f};
+
+// Which name the overlay shows. GW2 names fall back to the account name,
+// then the Discord name, when the player can't be identified.
+enum NameMode { NAME_DISCORD = 0, NAME_ACCOUNT = 1, NAME_CHARACTER = 2 };
+int   g_NameMode = NAME_DISCORD;
 
 // Saved overlay position. Y is the top edge when growing downward and the
 // bottom edge when growing upward, so the fixed edge is what gets restored.
@@ -87,6 +93,9 @@ struct OverlayState {
     std::unordered_map<std::string, TexRequest> texRequests;
     std::vector<VoiceUser> visibleUsers;
     std::vector<Texture_t*> userTextures;
+    std::vector<std::string> userNames;
+    // Manual links from the options panel: Discord user ID -> GW2 account (saved in config)
+    std::unordered_map<std::string, std::string> gw2Links;
     ULONGLONG hideUntil = 0;
     bool wasHovered = false;
     ImVec2 lastPos{0, 0};
@@ -168,6 +177,15 @@ static void LoadConfig() {
     ReadKey(j, "hide_when_not_in_voice", g_HideWhenNotInVoice);
     ReadKey(j, "grow_upward", g_GrowUpward);
     ReadKey(j, "hide_on_hover", g_HideOnHover);
+    ReadKey(j, "name_mode", g_NameMode);
+    g_NameMode = std::clamp(g_NameMode, (int)NAME_DISCORD, (int)NAME_CHARACTER);
+
+    auto links = j.find("gw2_links");
+    if (links != j.end() && links->is_object() && g_Overlay) {
+        for (auto it = links->begin(); it != links->end(); ++it)
+            if (it.value().is_string() && !it.value().get<std::string>().empty())
+                g_Overlay->gw2Links[it.key()] = it.value().get<std::string>();
+    }
 
     ReadKey(j, "overlay_scale", g_OverlayScale);
     g_OverlayScale = std::clamp(g_OverlayScale, 0.5f, 2.0f);
@@ -223,6 +241,12 @@ static void SaveConfig() {
         j["hide_when_not_in_voice"] = g_HideWhenNotInVoice;
         j["grow_upward"] = g_GrowUpward;
         j["hide_on_hover"] = g_HideOnHover;
+        j["name_mode"] = g_NameMode;
+        if (g_Overlay) {
+            nlohmann::json links = nlohmann::json::object();
+            for (const auto& kv : g_Overlay->gw2Links) links[kv.first] = kv.second;
+            j["gw2_links"] = links;
+        }
         j["overlay_scale"] = g_OverlayScale;
         j["avatar_size"] = g_AvatarSize;
         if (g_HasPos) {
@@ -282,6 +306,51 @@ static const std::string& DisplayName(const VoiceUser& user) {
     return user.nick.empty() ? user.username : user.nick;
 }
 
+static std::string MumbleCharacterName() {
+    // Name is a fixed 20-byte field with no guarantee of a terminator
+    return std::string(g_MumbleIdentity.Name, strnlen(g_MumbleIdentity.Name, sizeof(g_MumbleIdentity.Name)));
+}
+
+// GW2 account of a voice user without manual links: our own account, or one
+// written in their Discord nickname / display name ("[TAG] Name.1234").
+static std::string AutoGw2Account(const VoiceUser& user, const Gw2RosterSnapshot& roster) {
+    if (user.isSelf && !roster.selfAccount.empty()) return roster.selfAccount;
+    const std::string* texts[] = {&user.nick, &user.globalName};
+    for (const std::string* t : texts)
+        if (const Gw2Member* m = Gw2Roster::FindAccountInText(*t, roster.members))
+            return m->account;
+    for (const std::string* t : texts) {
+        std::string account = Gw2Roster::ParseAccountFromText(*t);
+        if (!account.empty()) return account;
+    }
+    return std::string();
+}
+
+static std::string Gw2Account(const VoiceUser& user, const Gw2RosterSnapshot& roster) {
+    auto link = g_Overlay->gw2Links.find(user.id);
+    if (link != g_Overlay->gw2Links.end()) return link->second;
+    return AutoGw2Account(user, roster);
+}
+
+// Name shown in the overlay for the chosen mode, falling back from
+// character to account to Discord name.
+static std::string OverlayName(const VoiceUser& user, const Gw2RosterSnapshot& roster) {
+    if (g_NameMode == NAME_DISCORD) return DisplayName(user);
+    if (g_NameMode == NAME_CHARACTER && user.isSelf) {
+        std::string name = MumbleCharacterName();
+        if (!name.empty()) return name;
+    }
+    std::string account = Gw2Account(user, roster);
+    if (account.empty()) return DisplayName(user);
+    if (g_NameMode == NAME_CHARACTER) {
+        std::string key = Gw2Roster::NormalizeAccount(account);
+        for (const auto& m : roster.members)
+            if (!m.character.empty() && Gw2Roster::NormalizeAccount(m.account) == key)
+                return m.character;
+    }
+    return account;
+}
+
 // First character of a UTF-8 string (1-4 bytes), for the fallback avatar.
 static std::string FirstGlyph(const std::string& s) {
     if (s.empty()) return std::string();
@@ -328,7 +397,7 @@ static void RenderUserDot(const VoiceUser& user) {
     ImGui::Dummy(ImVec2(radius * 2 + 4, ImGui::GetTextLineHeight()));
 }
 
-static void RenderUserAvatar(const VoiceUser& user, Texture_t* tex) {
+static void RenderUserAvatar(const VoiceUser& user, Texture_t* tex, const std::string& name) {
     float size = g_AvatarSize;
     float radius = size * 0.5f;
     float stroke = std::max(1.5f, size / 10.0f);
@@ -342,7 +411,7 @@ static void RenderUserAvatar(const VoiceUser& user, Texture_t* tex) {
     } else {
         // Fallback: coloured circle with the first letter of the name
         dl->AddCircleFilled(center, radius, IM_COL32(88, 101, 242, 255), 48);
-        std::string letter = FirstGlyph(DisplayName(user));
+        std::string letter = FirstGlyph(name);
         if (!letter.empty()) {
             ImVec2 ts = ImGui::CalcTextSize(letter.c_str());
             dl->AddText(ImVec2(center.x - ts.x * 0.5f + 1.0f, center.y - ts.y * 0.5f),
@@ -367,8 +436,8 @@ static void RenderUserAvatar(const VoiceUser& user, Texture_t* tex) {
 }
 
 // One line of the overlay: avatar or dot, then optionally the name.
-static void RenderUserRow(const VoiceUser& user, Texture_t* tex) {
-    if (g_ShowAvatars) RenderUserAvatar(user, tex);
+static void RenderUserRow(const VoiceUser& user, Texture_t* tex, const std::string& name) {
+    if (g_ShowAvatars) RenderUserAvatar(user, tex, name);
     else               RenderUserDot(user);
 
     if (!g_ShowNames && g_ShowAvatars) return;
@@ -380,7 +449,7 @@ static void RenderUserRow(const VoiceUser& user, Texture_t* tex) {
             float offset = (g_AvatarSize - ImGui::GetTextLineHeight()) * 0.5f;
             if (offset > 0) ImGui::SetCursorPosY(ImGui::GetCursorPosY() + offset);
         }
-        ImGui::TextColored(NameColor(user), "%s", DisplayName(user).c_str());
+        ImGui::TextColored(NameColor(user), "%s", name.c_str());
     }
 
     // Without avatars there is no X, so spell out the state
@@ -454,6 +523,11 @@ static void RenderVoiceOverlay() {
     ov.userTextures.clear();
     for (const auto& u : users)
         ov.userTextures.push_back(g_ShowAvatars ? GetAvatarTexture(u) : nullptr);
+    Gw2RosterSnapshot roster;
+    if (g_NameMode != NAME_DISCORD) roster = Gw2Roster::GetSnapshot();
+    ov.userNames.clear();
+    for (const auto& u : users)
+        ov.userNames.push_back(OverlayName(u, roster));
 
     // Hide-on-hover: when locked and hovered, hide for 5 seconds
     if (g_HideOnHover && g_LockPosition && !optionsOpen && GetTickCount64() < ov.hideUntil) {
@@ -524,7 +598,7 @@ static void RenderVoiceOverlay() {
         dummies[2].username = "UserMuted";
         dummies[2].mute = true;
         for (const auto& d : dummies)
-            RenderUserRow(d, nullptr);
+            RenderUserRow(d, nullptr, d.username);
         ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f),
                            g_LockPosition ? "Preview (unlock to move)" : "Drag to reposition");
     }
@@ -538,7 +612,7 @@ static void RenderVoiceOverlay() {
     int userCount = (int)users.size();
     for (int i = 0; i < userCount; i++) {
         int idx = g_GrowUpward ? (userCount - 1 - i) : i;
-        RenderUserRow(users[idx], ov.userTextures[idx]);
+        RenderUserRow(users[idx], ov.userTextures[idx], ov.userNames[idx]);
     }
 
     if (showChannel && g_GrowUpward) {
@@ -583,6 +657,7 @@ static void DestroyAll() {
         APIDefs->Events_Unsubscribe(EV_MUMBLE_IDENTITY_UPDATED, OnMumbleIdentityUpdated);
         g_MumbleSubscribed = false;
     }
+    Gw2Roster::Shutdown();
     if (g_RichPresence) {
         g_RichPresence->Shutdown();  // queues a presence clear, sent as IPC stops
         delete g_RichPresence;
@@ -626,6 +701,7 @@ void AddonLoad(AddonAPI_t* aApi) {
         g_MumbleLink = (Mumble::Data*)APIDefs->DataLink_Get(DL_MUMBLE_LINK);
         APIDefs->Events_Subscribe(EV_MUMBLE_IDENTITY_UPDATED, OnMumbleIdentityUpdated);
         g_MumbleSubscribed = true;
+        Gw2Roster::Init(APIDefs);
 
         g_Discord->Connect();
     } catch (const std::exception& e) {
@@ -681,10 +757,14 @@ static void DrainLogs() {
     if (g_RichPresence)
         for (const auto& msg : g_RichPresence->DrainLogQueue())
             APIDefs->Log(LOGL_INFO, "Discordant/RP", msg.c_str());
+    for (const auto& msg : Gw2Roster::DrainLogQueue())
+        APIDefs->Log(LOGL_INFO, "Discordant/GW2", msg.c_str());
 }
 
 static void RenderFrame() {
     if (!g_Discord || !g_Overlay) return;
+
+    Gw2Roster::Update();
 
     if (g_RichPresence) {
         RPGameState rpState;
@@ -731,6 +811,100 @@ void AddonRender() {
     } catch (...) {
         ReportCaughtError("render", nullptr);
     }
+}
+
+// "Player names" section of the options panel. Returns true if a setting changed.
+static bool PlayerNamesOptions() {
+    bool changed = false;
+    ImGui::Text("Show names as");
+    if (ImGui::RadioButton("Discord name", g_NameMode == NAME_DISCORD))     { g_NameMode = NAME_DISCORD; changed = true; }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("GW2 account", g_NameMode == NAME_ACCOUNT))      { g_NameMode = NAME_ACCOUNT; changed = true; }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("GW2 character", g_NameMode == NAME_CHARACTER))  { g_NameMode = NAME_CHARACTER; changed = true; }
+    ImGui::TextDisabled("Players are recognised when their Discord nickname contains their account name\n"
+                        "(e.g. Name.1234), or when linked below. Unrecognised players keep their Discord name;\n"
+                        "a character name needs the player to be in your party or squad.");
+
+    Gw2RosterSnapshot roster = Gw2Roster::GetSnapshot();
+    static const char* kSourceNames[SRC_COUNT] = {"RTAPI", "ArcDPS", "Unofficial Extras"};
+    ImGui::BeginGroup();
+    ImGui::Text("Squad data:");
+    for (int i = 0; i < SRC_COUNT; i++) {
+        ImGui::SameLine();
+        if (roster.sourceActive[i]) ImGui::TextColored(ImVec4(0.24f, 0.78f, 0.44f, 1.0f), "%s", kSourceNames[i]);
+        else                        ImGui::TextDisabled("%s", kSourceNames[i]);
+    }
+    ImGui::EndGroup();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Green: receiving data. Grey: not running, or nothing received yet\n"
+                          "(ArcDPS and Unofficial Extras report only once you are in a group).");
+
+    if (ImGui::TreeNode("Link Discord users to GW2 accounts")) {
+        VoiceSnapshot snap = g_Discord->GetVoiceSnapshot();
+        if (snap.users.empty())
+            ImGui::TextDisabled("Join a voice channel to link its members.");
+        for (const auto& u : snap.users) {
+            if (u.isSelf || u.id.empty()) continue;
+            ImGui::PushID(u.id.c_str());
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(DisplayName(u).c_str());
+            ImGui::SameLine(220.0f);
+
+            auto link = g_Overlay->gw2Links.find(u.id);
+            bool linked = link != g_Overlay->gw2Links.end();
+            std::string preview;
+            if (linked) {
+                preview = link->second;
+            } else {
+                std::string autoAccount = AutoGw2Account(u, roster);
+                preview = autoAccount.empty() ? "Automatic (not recognised)" : "Automatic: " + autoAccount;
+            }
+
+            ImGui::SetNextItemWidth(280.0f);
+            if (ImGui::BeginCombo("##link", preview.c_str())) {
+                if (ImGui::Selectable("Automatic", !linked)) {
+                    g_Overlay->gw2Links.erase(u.id);
+                    changed = true;
+                }
+                for (const auto& m : roster.members) {
+                    std::string label = m.character.empty() ? m.account : m.account + " (" + m.character + ")";
+                    bool selected = linked && Gw2Roster::NormalizeAccount(link->second) == Gw2Roster::NormalizeAccount(m.account);
+                    if (ImGui::Selectable(label.c_str(), selected)) {
+                        g_Overlay->gw2Links[u.id] = m.account;
+                        changed = true;
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::PopID();
+        }
+        if (roster.members.empty())
+            ImGui::TextDisabled("Join a party or squad with someone to pick their account here.");
+
+        // Links are kept for people who have left the channel, so offer a way to clear them all
+        unsigned linkCount = (unsigned)g_Overlay->gw2Links.size();
+        if (linkCount > 0) {
+            char label[64];
+            snprintf(label, sizeof(label), "Forget all links (%u)", linkCount);
+            if (ImGui::Button(label))
+                ImGui::OpenPopup("##forget_links");
+            if (ImGui::BeginPopup("##forget_links")) {
+                ImGui::Text("Forget all %u saved links? This cannot be undone.", linkCount);
+                if (ImGui::Button("Forget")) {
+                    g_Overlay->gw2Links.clear();
+                    changed = true;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel"))
+                    ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+            }
+        }
+        ImGui::TreePop();
+    }
+    return changed;
 }
 
 static void OptionsPanel() {
@@ -797,6 +971,11 @@ static void OptionsPanel() {
     changed |= ImGui::ColorEdit4("Silent##col", g_ColSilent, colFlags);
     changed |= ImGui::ColorEdit4("Muted##col", g_ColMuted, colFlags);
     changed |= ImGui::ColorEdit4("Channel name##col", g_ColChannel, colFlags);
+
+    ImGui::Separator();
+    ImGui::Text("Player names");
+    ImGui::Spacing();
+    changed |= PlayerNamesOptions();
 
     ImGui::Separator();
     ImGui::Text("Rich Presence");
