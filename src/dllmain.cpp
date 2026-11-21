@@ -53,6 +53,10 @@ float g_ColChannel[4]    = {0.34f, 0.40f, 0.96f, 1.0f};
 // then the Discord name, when the player can't be identified.
 enum NameMode { NAME_DISCORD = 0, NAME_ACCOUNT = 1, NAME_CHARACTER = 2 };
 int   g_NameMode = NAME_DISCORD;
+// Optional second name shown dimmed in brackets after the first: a NameMode,
+// or BRACKET_NONE. Hidden when it would repeat the first name.
+constexpr int BRACKET_NONE = -1;
+int   g_BracketMode = BRACKET_NONE;
 
 // Saved overlay position. Y is the top edge when growing downward and the
 // bottom edge when growing upward, so the fixed edge is what gets restored.
@@ -96,6 +100,7 @@ struct OverlayState {
     std::vector<VoiceUser> visibleUsers;
     std::vector<Texture_t*> userTextures;
     std::vector<std::string> userNames;
+    std::vector<std::string> userBrackets;
     // Manual links from the options panel: Discord user ID -> GW2 account (saved in config)
     std::unordered_map<std::string, std::string> gw2Links;
     ULONGLONG hideUntil = 0;
@@ -181,6 +186,9 @@ static void LoadConfig() {
     ReadKey(j, "hide_on_hover", g_HideOnHover);
     ReadKey(j, "name_mode", g_NameMode);
     g_NameMode = std::clamp(g_NameMode, (int)NAME_DISCORD, (int)NAME_CHARACTER);
+    ReadKey(j, "name_bracket", g_BracketMode);
+    g_BracketMode = std::clamp(g_BracketMode, BRACKET_NONE, (int)NAME_CHARACTER);
+    if (g_BracketMode == g_NameMode) g_BracketMode = BRACKET_NONE;
 
     auto links = j.find("gw2_links");
     if (links != j.end() && links->is_object() && g_Overlay) {
@@ -244,6 +252,7 @@ static void SaveConfig() {
         j["grow_upward"] = g_GrowUpward;
         j["hide_on_hover"] = g_HideOnHover;
         j["name_mode"] = g_NameMode;
+        j["name_bracket"] = g_BracketMode;
         if (g_Overlay) {
             nlohmann::json links = nlohmann::json::object();
             for (const auto& kv : g_Overlay->gw2Links) links[kv.first] = kv.second;
@@ -364,23 +373,39 @@ static void PublishVoiceBridge() {
     VoiceBridge::Publish(connected, channel, out);
 }
 
-// Name shown in the overlay for the chosen mode, falling back from
-// character to account to Discord name.
-static std::string OverlayName(const VoiceUser& user, const Gw2RosterSnapshot& roster) {
-    if (g_NameMode == NAME_DISCORD) return DisplayName(user);
-    if (g_NameMode == NAME_CHARACTER && user.isSelf) {
+// GW2 name for NAME_ACCOUNT or NAME_CHARACTER: a character name falls back
+// to the account. Empty if the player can't be identified.
+static std::string Gw2Name(const VoiceUser& user, const Gw2RosterSnapshot& roster, int mode) {
+    if (mode == NAME_CHARACTER && user.isSelf) {
         std::string name = MumbleCharacterName();
         if (!name.empty()) return name;
     }
     std::string account = Gw2Account(user, roster);
-    if (account.empty()) return DisplayName(user);
-    if (g_NameMode == NAME_CHARACTER) {
+    if (account.empty()) return account;
+    if (mode == NAME_CHARACTER) {
         std::string key = Gw2Roster::NormalizeAccount(account);
         for (const auto& m : roster.members)
             if (!m.character.empty() && Gw2Roster::NormalizeAccount(m.account) == key)
                 return m.character;
     }
     return account;
+}
+
+// Name shown in the overlay for the chosen mode, falling back from
+// character to account to Discord name.
+static std::string OverlayName(const VoiceUser& user, const Gw2RosterSnapshot& roster) {
+    if (g_NameMode == NAME_DISCORD) return DisplayName(user);
+    std::string name = Gw2Name(user, roster, g_NameMode);
+    return name.empty() ? DisplayName(user) : name;
+}
+
+// Second name for the brackets, or empty when there's nothing different to add.
+static std::string BracketName(const VoiceUser& user, const Gw2RosterSnapshot& roster,
+                               const std::string& mainName) {
+    if (g_BracketMode == BRACKET_NONE || g_BracketMode == g_NameMode) return std::string();
+    std::string name = g_BracketMode == NAME_DISCORD ? DisplayName(user)
+                                                     : Gw2Name(user, roster, g_BracketMode);
+    return name == mainName ? std::string() : name;
 }
 
 // First character of a UTF-8 string (1-4 bytes), for the fallback avatar.
@@ -468,7 +493,8 @@ static void RenderUserAvatar(const VoiceUser& user, Texture_t* tex, const std::s
 }
 
 // One line of the overlay: avatar or dot, then optionally the name.
-static void RenderUserRow(const VoiceUser& user, Texture_t* tex, const std::string& name) {
+static void RenderUserRow(const VoiceUser& user, Texture_t* tex, const std::string& name,
+                          const std::string& bracket) {
     if (g_ShowAvatars) RenderUserAvatar(user, tex, name);
     else               RenderUserDot(user);
 
@@ -481,7 +507,13 @@ static void RenderUserRow(const VoiceUser& user, Texture_t* tex, const std::stri
             float offset = (g_AvatarSize - ImGui::GetTextLineHeight()) * 0.5f;
             if (offset > 0) ImGui::SetCursorPosY(ImGui::GetCursorPosY() + offset);
         }
-        ImGui::TextColored(NameColor(user), "%s", name.c_str());
+        ImVec4 col = NameColor(user);
+        ImGui::TextColored(col, "%s", name.c_str());
+        if (!bracket.empty()) {
+            ImGui::SameLine();
+            col.w *= 0.6f;  // dimmer, so the main name stands out
+            ImGui::TextColored(col, "(%s)", bracket.c_str());
+        }
     }
 
     // Without avatars there is no X, so spell out the state
@@ -556,10 +588,14 @@ static void RenderVoiceOverlay() {
     for (const auto& u : users)
         ov.userTextures.push_back(g_ShowAvatars ? GetAvatarTexture(u) : nullptr);
     Gw2RosterSnapshot roster;
-    if (g_NameMode != NAME_DISCORD) roster = Gw2Roster::GetSnapshot();
+    bool bracketGw2 = g_BracketMode == NAME_ACCOUNT || g_BracketMode == NAME_CHARACTER;
+    if (g_NameMode != NAME_DISCORD || bracketGw2) roster = Gw2Roster::GetSnapshot();
     ov.userNames.clear();
-    for (const auto& u : users)
+    ov.userBrackets.clear();
+    for (const auto& u : users) {
         ov.userNames.push_back(OverlayName(u, roster));
+        ov.userBrackets.push_back(BracketName(u, roster, ov.userNames.back()));
+    }
 
     // Hide-on-hover: when locked and hovered, hide for 5 seconds
     if (g_HideOnHover && g_LockPosition && !optionsOpen && GetTickCount64() < ov.hideUntil) {
@@ -630,7 +666,7 @@ static void RenderVoiceOverlay() {
         dummies[2].username = "UserMuted";
         dummies[2].mute = true;
         for (const auto& d : dummies)
-            RenderUserRow(d, nullptr, d.username);
+            RenderUserRow(d, nullptr, d.username, std::string());
         ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f),
                            g_LockPosition ? "Preview (unlock to move)" : "Drag to reposition");
     }
@@ -644,7 +680,7 @@ static void RenderVoiceOverlay() {
     int userCount = (int)users.size();
     for (int i = 0; i < userCount; i++) {
         int idx = g_GrowUpward ? (userCount - 1 - i) : i;
-        RenderUserRow(users[idx], ov.userTextures[idx], ov.userNames[idx]);
+        RenderUserRow(users[idx], ov.userTextures[idx], ov.userNames[idx], ov.userBrackets[idx]);
     }
 
     if (showChannel && g_GrowUpward) {
@@ -857,6 +893,19 @@ static bool PlayerNamesOptions() {
     if (ImGui::RadioButton("GW2 account", g_NameMode == NAME_ACCOUNT))      { g_NameMode = NAME_ACCOUNT; changed = true; }
     ImGui::SameLine();
     if (ImGui::RadioButton("GW2 character", g_NameMode == NAME_CHARACTER))  { g_NameMode = NAME_CHARACTER; changed = true; }
+    if (g_BracketMode == g_NameMode) { g_BracketMode = BRACKET_NONE; changed = true; }
+
+    static const char* kModeNames[] = {"Discord name", "GW2 account", "GW2 character"};
+    ImGui::SetNextItemWidth(160.0f);
+    const char* bracketPreview = g_BracketMode == BRACKET_NONE ? "None" : kModeNames[g_BracketMode];
+    if (ImGui::BeginCombo("In brackets after it", bracketPreview)) {
+        if (ImGui::Selectable("None", g_BracketMode == BRACKET_NONE)) { g_BracketMode = BRACKET_NONE; changed = true; }
+        for (int m = NAME_DISCORD; m <= NAME_CHARACTER; m++) {
+            if (m == g_NameMode) continue;
+            if (ImGui::Selectable(kModeNames[m], g_BracketMode == m)) { g_BracketMode = m; changed = true; }
+        }
+        ImGui::EndCombo();
+    }
     ImGui::TextDisabled("Players are recognised when their Discord nickname contains their account name\n"
                         "(e.g. Name.1234), or when linked below. Unrecognised players keep their Discord name;\n"
                         "a character name needs the player to be in your party or squad.");
