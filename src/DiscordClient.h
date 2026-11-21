@@ -15,6 +15,8 @@ struct VoiceUser {
     std::string username;
     std::string avatar;
     std::string nick;       // server nickname
+    std::string globalName; // Discord display name
+    bool isSelf = false;    // the signed-in user
     bool mute = false;      // server muted or self-muted or suppressed
     bool deaf = false;      // server deafened or self-deafened
     bool speaking = false;

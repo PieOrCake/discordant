@@ -274,6 +274,7 @@ static VoiceUser ParseVoiceUserFromJSON(const nlohmann::json& d) {
         u.id       = StringMember(*user, "id");
         u.username = StringMember(*user, "username");
         u.avatar   = StringMember(*user, "avatar");
+        u.globalName = StringMember(*user, "global_name");
     }
     u.nick = StringMember(d, "nick");
     if (const json* vs = ObjectMember(d, "voice_state")) {
@@ -497,7 +498,9 @@ void DiscordClient::HandleMessageImpl(const std::string& message) {
             for (const auto& vs : *vsIt) {
                 if (!vs.is_object()) continue;
                 VoiceUser u = ParseVoiceUserFromJSON(vs);
-                if (!u.id.empty()) users.push_back(std::move(u));
+                if (u.id.empty()) continue;
+                u.isSelf = !m_userId.empty() && u.id == m_userId;
+                users.push_back(std::move(u));
             }
         }
 
@@ -688,6 +691,7 @@ void DiscordClient::UpdateUser(const std::string& id, const VoiceUser& partial) 
             if (!partial.username.empty()) u.username = partial.username;
             if (!partial.avatar.empty()) u.avatar = partial.avatar;
             if (!partial.nick.empty()) u.nick = partial.nick;
+            if (!partial.globalName.empty()) u.globalName = partial.globalName;
             u.mute = partial.mute;
             u.deaf = partial.deaf;
             // Don't overwrite speaking from voice state events (speaking comes from SPEAKING_START/STOP)
@@ -696,6 +700,7 @@ void DiscordClient::UpdateUser(const std::string& id, const VoiceUser& partial) 
     }
     // New user
     m_users.push_back(partial);
+    m_users.back().isSelf = !m_userId.empty() && id == m_userId;
 }
 
 void DiscordClient::RemoveUser(const std::string& id) {
