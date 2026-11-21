@@ -498,7 +498,9 @@ void DiscordClient::HandleMessageImpl(const std::string& message) {
             for (const auto& vs : *vsIt) {
                 if (!vs.is_object()) continue;
                 VoiceUser u = ParseVoiceUserFromJSON(vs);
-                if (!u.id.empty()) users.push_back(std::move(u));
+                if (u.id.empty()) continue;
+                u.isSelf = !m_userId.empty() && u.id == m_userId;
+                users.push_back(std::move(u));
             }
         }
 
