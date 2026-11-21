@@ -18,6 +18,8 @@
 #include "RichPresence.h"
 #include "DiscordIPC.h"
 #include "Gw2Roster.h"
+#include "VoiceBridge.h"
+#include "bridge/PieUIBridge.h"
 
 // Version constants
 #define V_MAJOR 0
@@ -330,6 +332,36 @@ static std::string Gw2Account(const VoiceUser& user, const Gw2RosterSnapshot& ro
     auto link = g_Overlay->gw2Links.find(user.id);
     if (link != g_Overlay->gw2Links.end()) return link->second;
     return AutoGw2Account(user, roster);
+}
+
+// Share the voice channel with other addons (Pie UI) every frame, whatever
+// the overlay's name mode is.
+static void PublishVoiceBridge() {
+    bool connected = g_Discord->GetState() == DiscordState::Connected;
+    std::vector<VoiceBridge::User> out;
+    std::string channel;
+    if (connected) {
+        VoiceSnapshot snap = g_Discord->GetVoiceSnapshot();
+        channel = snap.channelName;
+        if (!snap.users.empty()) {
+            Gw2RosterSnapshot roster = Gw2Roster::GetSnapshot();
+            out.reserve(snap.users.size());
+            for (const auto& u : snap.users) {
+                VoiceBridge::User b;
+                b.account = Gw2Account(u, roster);
+                b.discordName = !u.nick.empty() ? u.nick
+                              : !u.globalName.empty() ? u.globalName : u.username;
+                b.discordId = u.id;
+                if (u.speaking) b.flags |= Bridge::DISCORDANT_USER_SPEAKING;
+                if (u.mute)     b.flags |= Bridge::DISCORDANT_USER_MUTED;
+                if (u.deaf)     b.flags |= Bridge::DISCORDANT_USER_DEAFENED;
+                if (u.isSelf)   b.flags |= Bridge::DISCORDANT_USER_SELF;
+                if (g_Overlay->gw2Links.count(u.id)) b.flags |= Bridge::DISCORDANT_USER_MANUAL_LINK;
+                out.push_back(std::move(b));
+            }
+        }
+    }
+    VoiceBridge::Publish(connected, channel, out);
 }
 
 // Name shown in the overlay for the chosen mode, falling back from
@@ -657,6 +689,7 @@ static void DestroyAll() {
         APIDefs->Events_Unsubscribe(EV_MUMBLE_IDENTITY_UPDATED, OnMumbleIdentityUpdated);
         g_MumbleSubscribed = false;
     }
+    VoiceBridge::Shutdown();
     Gw2Roster::Shutdown();
     if (g_RichPresence) {
         g_RichPresence->Shutdown();  // queues a presence clear, sent as IPC stops
@@ -702,6 +735,7 @@ void AddonLoad(AddonAPI_t* aApi) {
         APIDefs->Events_Subscribe(EV_MUMBLE_IDENTITY_UPDATED, OnMumbleIdentityUpdated);
         g_MumbleSubscribed = true;
         Gw2Roster::Init(APIDefs);
+        VoiceBridge::Init(APIDefs);
 
         g_Discord->Connect();
     } catch (const std::exception& e) {
@@ -765,6 +799,7 @@ static void RenderFrame() {
     if (!g_Discord || !g_Overlay) return;
 
     Gw2Roster::Update();
+    PublishVoiceBridge();
 
     if (g_RichPresence) {
         RPGameState rpState;
@@ -827,7 +862,7 @@ static bool PlayerNamesOptions() {
                         "a character name needs the player to be in your party or squad.");
 
     Gw2RosterSnapshot roster = Gw2Roster::GetSnapshot();
-    static const char* kSourceNames[SRC_COUNT] = {"RTAPI", "ArcDPS", "Unofficial Extras"};
+    static const char* kSourceNames[SRC_COUNT] = {"RTAPI", "ArcDPS", "Unofficial Extras", "Pie UI"};
     ImGui::BeginGroup();
     ImGui::Text("Squad data:");
     for (int i = 0; i < SRC_COUNT; i++) {

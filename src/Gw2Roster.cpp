@@ -9,6 +9,7 @@
 
 #include "nexus/Nexus.h"
 #include "rtapi/RTAPI.hpp"
+#include "bridge/PieUIBridge.h"
 
 namespace {
 
@@ -65,6 +66,7 @@ const char* SourceName(int src) {
     switch (src) {
     case SRC_RTAPI:  return "RTAPI";
     case SRC_ARCDPS: return "ArcDPS";
+    case SRC_PIEUI:  return "Pie UI";
     default:         return "Unofficial Extras";
     }
 }
@@ -72,6 +74,7 @@ const char* SourceName(int src) {
 struct Entry {
     std::string account;    // display form
     std::string charRtapi;  // RTAPI is preferred: it knows members on other maps
+    std::string charPieui;
     std::string charArc;
     uint8_t     sources = 0;  // bit per Gw2Source
 };
@@ -80,8 +83,11 @@ struct State {
     AddonAPI_t* api = nullptr;
     std::unordered_map<std::string, Entry> members;  // keyed by NormalizeAccount
     std::string selfRtapi;
+    std::string selfPieui;
     std::string selfArc;  // from the ArcDPS Integration (ArcDPS or Extras)
     RTAPI::RealTimeData* rtapi = nullptr;
+    const uint8_t* pieui = nullptr;  // PIEUI_GROUP block, read on the render thread
+    uint32_t pieuiSequence = 0;
     bool replayPending = false;
     bool active[SRC_COUNT] = {};
     std::vector<std::string> logQueue;
@@ -123,8 +129,11 @@ void Join(int src, const std::string& account, const std::string& character) {
     Entry& e = s->members[Gw2Roster::NormalizeAccount(account)];
     e.account = account;
     e.sources |= (uint8_t)(1u << src);
-    if (!character.empty())
-        (src == SRC_RTAPI ? e.charRtapi : e.charArc) = character;
+    if (!character.empty()) {
+        if (src == SRC_RTAPI)       e.charRtapi = character;
+        else if (src == SRC_PIEUI)  e.charPieui = character;
+        else                        e.charArc = character;
+    }
 }
 
 void Leave(int src, const std::string& account) {
@@ -134,6 +143,7 @@ void Leave(int src, const std::string& account) {
     e.sources &= (uint8_t)~(1u << src);
     if (src == SRC_RTAPI)  e.charRtapi.clear();
     if (src == SRC_ARCDPS) e.charArc.clear();
+    if (src == SRC_PIEUI)  e.charPieui.clear();
     if (e.sources == 0) s->members.erase(it);
 }
 
@@ -245,6 +255,8 @@ void OnAddonLoaded(void* args) {
         // replay request is sent on the next frame (Update).
         if (sig == ARCDPS_INTEGRATION_SIG)
             s->replayPending = true;
+        if (sig == Bridge::kPieUISignature)
+            s->pieui = static_cast<const uint8_t*>(s->api->DataLink_Get(Bridge::DL_PIEUI_GROUP));
     });
 }
 
@@ -257,12 +269,52 @@ void OnAddonUnloaded(void* args) {
             s->selfRtapi.clear();
             DropSource(SRC_RTAPI);
         }
+        if (sig == Bridge::kPieUISignature) {
+            s->pieui = nullptr;  // its memory may be gone: never touch it again
+            s->selfPieui.clear();
+            DropSource(SRC_PIEUI);
+        }
         if (sig == ARCDPS_INTEGRATION_SIG) {
             s->selfArc.clear();
             DropSource(SRC_ARCDPS);
             DropSource(SRC_EXTRAS);
         }
     });
+}
+
+// Pie UI's roster block. Pie UI writes it in its own render callback, and
+// this runs in ours on the same thread, so it is never half-written.
+void ReadPieUI() {
+    using namespace Bridge;
+    const Header* h = reinterpret_cast<const Header*>(s->pieui);
+    bool usable = h && h->Version == kVersion && h->Active
+               && h->HeaderSize >= sizeof(Header)
+               && h->EntrySize >= sizeof(PieUIGroupMember) && h->EntrySize <= 4096
+               && h->EntriesOffset >= h->HeaderSize && h->EntriesOffset <= 4096
+               && h->MaxEntries <= 1024;
+    if (!usable) {
+        if (s->active[SRC_PIEUI]) {
+            s->selfPieui.clear();
+            DropSource(SRC_PIEUI);
+        }
+        return;
+    }
+    if (s->active[SRC_PIEUI] && h->Sequence == s->pieuiSequence) return;
+    s->pieuiSequence = h->Sequence;
+
+    MarkActive(SRC_PIEUI);
+    ClearSource(SRC_PIEUI);
+    s->selfPieui.clear();
+    uint32_t count = std::min(h->Count, h->MaxEntries);
+    for (uint32_t i = 0; i < count; i++) {
+        const auto* m = reinterpret_cast<const PieUIGroupMember*>(
+            s->pieui + h->EntriesOffset + (size_t)i * h->EntrySize);
+        std::string account = CleanAccount(m->AccountName, sizeof(m->AccountName));
+        if (account.empty()) continue;
+        if (m->Flags & PIEUI_MEMBER_SELF) { s->selfPieui = account; continue; }
+        Join(SRC_PIEUI, account,
+             std::string(m->CharacterName, strnlen(m->CharacterName, sizeof(m->CharacterName))));
+    }
 }
 
 struct Subscription { const char* event; void (*callback)(void*); };
@@ -307,6 +359,7 @@ void Init(AddonAPI_t* api) {
     // RTAPI sends its group members to addons loaded after it; if it loads
     // later, EV_ADDON_LOADED picks up its DataLink.
     s->rtapi = static_cast<RTAPI::RealTimeData*>(api->DataLink_Get(DL_RTAPI));
+    s->pieui = static_cast<const uint8_t*>(api->DataLink_Get(Bridge::DL_PIEUI_GROUP));
     for (const auto& sub : kSubscriptions)
         api->Events_Subscribe(sub.event, sub.callback);
     RequestReplay(api);
@@ -338,6 +391,7 @@ void Update() {
                 MarkActive(SRC_RTAPI);
             }
         }
+        ReadPieUI();
     }
     // Raised outside the lock: the integration may answer on another thread
     if (replay) RequestReplay(api);
@@ -347,12 +401,15 @@ Gw2RosterSnapshot GetSnapshot() {
     Gw2RosterSnapshot snap;
     LockGuard lock;
     if (!s) return snap;
-    snap.selfAccount = s->selfRtapi.empty() ? s->selfArc : s->selfRtapi;
+    snap.selfAccount = !s->selfRtapi.empty() ? s->selfRtapi
+                     : !s->selfPieui.empty() ? s->selfPieui : s->selfArc;
     std::string selfKey = NormalizeAccount(snap.selfAccount);
     for (const auto& kv : s->members) {
         if (kv.first == selfKey) continue;  // Extras lists us among the squad
         const Entry& e = kv.second;
-        snap.members.push_back({e.account, e.charRtapi.empty() ? e.charArc : e.charRtapi});
+        const std::string& character = !e.charRtapi.empty() ? e.charRtapi
+                                     : !e.charPieui.empty() ? e.charPieui : e.charArc;
+        snap.members.push_back({e.account, character});
     }
     std::sort(snap.members.begin(), snap.members.end(),
               [](const Gw2Member& a, const Gw2Member& b) { return a.account < b.account; });

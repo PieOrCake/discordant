@@ -8,8 +8,9 @@ struct AddonAPI_t;
 //   RTAPI          - account + character names (party and squad, any map)
 //   ArcDPS         - account + character names, via Raidcore's ArcDPS Integration
 //   Unofficial Extras - account names only, via the same integration
+//   Pie UI         - account + character names, from its PIEUI_GROUP DataLink
 // None of them is required; each is used if it delivers data.
-enum Gw2Source { SRC_RTAPI = 0, SRC_ARCDPS, SRC_EXTRAS, SRC_COUNT };
+enum Gw2Source { SRC_RTAPI = 0, SRC_ARCDPS, SRC_EXTRAS, SRC_PIEUI, SRC_COUNT };
 
 struct Gw2Member {
     std::string account;    // "Name.1234", without the leading ':'

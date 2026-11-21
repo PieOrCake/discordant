@@ -26,6 +26,7 @@ On first use, Discord will show a one-time authorization prompt. After that, the
 - **Auto-follow** — automatically tracks when you switch voice channels
 - **Customisable** — avatar size, font size, colours (including a fully transparent background), show only who's speaking, hide names, hide when not in voice, grow up or down
 - **GW2 names** — optionally show players' GW2 account or character names instead of their Discord names (see below)
+- **Pie UI integration** — shares who is in voice and who is speaking, so Pie UI can show it on its party/squad frames
 - **Remembers its position** between game sessions
 - **Lightweight** — no external processes, no bot, just a single DLL
 
@@ -37,7 +38,7 @@ The overlay can show each person's GW2 account name or current character name in
 - you link them by hand in the options panel (saved between sessions), picking from your current party or squad
 - it's you
 
-Character names, and picking players to link, need squad data from at least one of these optional addons: [RealTime API](https://raidcore.gg/gw2/addons/rtapi), or ArcDPS / Unofficial Extras through Raidcore's ArcDPS Integration. Discordant uses whichever of them are running, and the options panel shows which are delivering data. Anyone who can't be identified keeps their Discord name; a recognised player outside your group shows their account name.
+Character names, and picking players to link, need squad data from at least one of these optional addons: [RealTime API](https://raidcore.gg/gw2/addons/rtapi), Pie UI, or ArcDPS / Unofficial Extras through Raidcore's ArcDPS Integration. Discordant uses whichever of them are running, and the options panel shows which are delivering data. Anyone who can't be identified keeps their Discord name; a recognised player outside your group shows their account name.
 
 ### Rich Presence
 
@@ -107,14 +108,16 @@ discordant/
 ├── include/
 │   ├── nexus/Nexus.h       # Raidcore Nexus API header
 │   ├── mumble/Mumble.h     # MumbleLink structs
-│   └── rtapi/RTAPI.hpp     # RealTime API header
+│   ├── rtapi/RTAPI.hpp     # RealTime API header
+│   └── bridge/PieUIBridge.h # Data shared with Pie UI
 ├── src/
 │   ├── dllmain.cpp         # Addon entry point, ImGui overlay, Nexus integration
 │   ├── DiscordClient.h/cpp # Discord RPC auth flow, voice event handling
 │   ├── WebSocket.h/cpp     # Minimal WebSocket client (Winsock2)
 │   ├── DiscordIPC.h/cpp    # Named pipe IPC client for Rich Presence
 │   ├── RichPresence.h/cpp  # MumbleLink → Discord activity updates
-│   ├── Gw2Roster.h/cpp     # Squad/party names from RTAPI, ArcDPS, Unofficial Extras
+│   ├── Gw2Roster.h/cpp     # Squad/party names from RTAPI, ArcDPS, Unofficial Extras, Pie UI
+│   ├── VoiceBridge.h/cpp   # Shares voice channel info with Pie UI
 │   └── MapData.h           # GW2 map ID → name lookup table
 ├── scripts/
 │   └── setup.sh            # Dependency download script
