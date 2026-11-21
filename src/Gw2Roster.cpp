@@ -5,7 +5,6 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
-#include <mutex>
 #include <unordered_map>
 
 #include "nexus/Nexus.h"
@@ -53,7 +52,9 @@ struct ExtrasUserInfo {
     uint32_t    Unused;
 };
 static_assert(sizeof(ExtrasUserInfo) == 24, "must match Unofficial Extras' UserInfo");
-constexpr uint8_t EXTRAS_ROLE_NONE = 5;
+// Roles 0-2 are leader, lieutenant, member. Invited (3) and Applied (4) are
+// not in the squad yet, and None (5) means removed.
+constexpr uint8_t EXTRAS_ROLE_MEMBER = 2;
 
 struct ExtrasSquadUpdate {
     ExtrasUserInfo* UserInfo;
@@ -77,7 +78,6 @@ struct Entry {
 
 struct State {
     AddonAPI_t* api = nullptr;
-    std::mutex mutex;
     std::unordered_map<std::string, Entry> members;  // keyed by NormalizeAccount
     std::string selfRtapi;
     std::string selfArc;  // from the ArcDPS Integration (ArcDPS or Extras)
@@ -90,6 +90,18 @@ struct State {
 // Heap-allocated in Init: no non-trivial globals (DllMain constraint).
 State* s = nullptr;
 
+// Guards `s` itself as well as its contents, so a callback arriving on
+// another thread during Shutdown either finishes first or sees nullptr.
+// SRWLOCK is plain data, so it is safe as a global.
+SRWLOCK g_lock = SRWLOCK_INIT;
+
+struct LockGuard {
+    LockGuard()  { AcquireSRWLockExclusive(&g_lock); }
+    ~LockGuard() { ReleaseSRWLockExclusive(&g_lock); }
+    LockGuard(const LockGuard&) = delete;
+    LockGuard& operator=(const LockGuard&) = delete;
+};
+
 // Account names arrive with a leading ':' and in fixed-size buffers.
 std::string CleanAccount(const char* name, size_t maxLen) {
     if (!name) return std::string();
@@ -98,7 +110,7 @@ std::string CleanAccount(const char* name, size_t maxLen) {
     return std::string(name, n);
 }
 
-// The helpers below expect s->mutex to be held.
+// The helpers below expect g_lock to be held.
 
 void MarkActive(int src) {
     if (s->active[src]) return;
@@ -145,8 +157,8 @@ void DropSource(int src) {
 template <typename F>
 void Guarded(F&& f) {
     try {
+        LockGuard lock;
         if (!s) return;
-        std::lock_guard<std::mutex> lock(s->mutex);
         f();
     } catch (...) {}
 }
@@ -217,8 +229,8 @@ void OnExtrasSquadUpdate(void* args) {
         for (uint64_t i = 0; i < u->UsersCount; i++) {
             const ExtrasUserInfo& info = u->UserInfo[i];
             std::string account = CleanAccount(info.AccountName, 140);
-            if (info.Role == EXTRAS_ROLE_NONE) Leave(SRC_EXTRAS, account);
-            else                               Join(SRC_EXTRAS, account, std::string());
+            if (info.Role <= EXTRAS_ROLE_MEMBER) Join(SRC_EXTRAS, account, std::string());
+            else                                 Leave(SRC_EXTRAS, account);
         }
     });
 }
@@ -304,15 +316,18 @@ void Shutdown() {
     if (!s) return;
     for (const auto& sub : kSubscriptions)
         s->api->Events_Unsubscribe(sub.event, sub.callback);
+    LockGuard lock;  // waits for any callback still running
     delete s;
     s = nullptr;
 }
 
 void Update() {
-    if (!s) return;
     bool replay = false;
+    AddonAPI_t* api = nullptr;
     {
-        std::lock_guard<std::mutex> lock(s->mutex);
+        LockGuard lock;
+        if (!s) return;
+        api = s->api;
         replay = s->replayPending;
         s->replayPending = false;
         // RTAPI knows our own account even when we're not in a group
@@ -324,13 +339,14 @@ void Update() {
             }
         }
     }
-    if (replay) RequestReplay(s->api);
+    // Raised outside the lock: the integration may answer on another thread
+    if (replay) RequestReplay(api);
 }
 
 Gw2RosterSnapshot GetSnapshot() {
     Gw2RosterSnapshot snap;
+    LockGuard lock;
     if (!s) return snap;
-    std::lock_guard<std::mutex> lock(s->mutex);
     snap.selfAccount = s->selfRtapi.empty() ? s->selfArc : s->selfRtapi;
     std::string selfKey = NormalizeAccount(snap.selfAccount);
     for (const auto& kv : s->members) {
@@ -346,8 +362,8 @@ Gw2RosterSnapshot GetSnapshot() {
 
 std::vector<std::string> DrainLogQueue() {
     std::vector<std::string> out;
+    LockGuard lock;
     if (!s) return out;
-    std::lock_guard<std::mutex> lock(s->mutex);
     out.swap(s->logQueue);
     return out;
 }
