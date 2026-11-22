@@ -22,9 +22,9 @@
 #include "bridge/PieUIBridge.h"
 
 // Version constants
-#define V_MAJOR 0
-#define V_MINOR 9
-#define V_BUILD 4
+#define V_MAJOR 1
+#define V_MINOR 0
+#define V_BUILD 0
 #define V_REVISION 0
 
 // Global variables — all POD/trivial to avoid DllMain issues
@@ -57,6 +57,11 @@ int   g_NameMode = NAME_DISCORD;
 // or BRACKET_NONE. Hidden when it would repeat the first name.
 constexpr int BRACKET_NONE = -1;
 int   g_BracketMode = BRACKET_NONE;
+// Who the overlay lists. Group frames in other addons (Pie UI) already show
+// voice for party/squad members, so those can be left out, or the overlay
+// turned off entirely while Discordant keeps feeding the bridge.
+enum OverlayUsers { OVERLAY_EVERYONE = 0, OVERLAY_OUTSIDE_GROUP = 1, OVERLAY_NOBODY = 2 };
+int   g_OverlayUsers = OVERLAY_EVERYONE;
 
 // Saved overlay position. Y is the top edge when growing downward and the
 // bottom edge when growing upward, so the fixed edge is what gets restored.
@@ -189,6 +194,8 @@ static void LoadConfig() {
     ReadKey(j, "name_bracket", g_BracketMode);
     g_BracketMode = std::clamp(g_BracketMode, BRACKET_NONE, (int)NAME_CHARACTER);
     if (g_BracketMode == g_NameMode) g_BracketMode = BRACKET_NONE;
+    ReadKey(j, "overlay_users", g_OverlayUsers);
+    g_OverlayUsers = std::clamp(g_OverlayUsers, (int)OVERLAY_EVERYONE, (int)OVERLAY_NOBODY);
 
     auto links = j.find("gw2_links");
     if (links != j.end() && links->is_object() && g_Overlay) {
@@ -253,6 +260,7 @@ static void SaveConfig() {
         j["hide_on_hover"] = g_HideOnHover;
         j["name_mode"] = g_NameMode;
         j["name_bracket"] = g_BracketMode;
+        j["overlay_users"] = g_OverlayUsers;
         if (g_Overlay) {
             nlohmann::json links = nlohmann::json::object();
             for (const auto& kv : g_Overlay->gw2Links) links[kv.first] = kv.second;
@@ -341,6 +349,19 @@ static std::string Gw2Account(const VoiceUser& user, const Gw2RosterSnapshot& ro
     auto link = g_Overlay->gw2Links.find(user.id);
     if (link != g_Overlay->gw2Links.end()) return link->second;
     return AutoGw2Account(user, roster);
+}
+
+// True when the voice user is in our party/squad, i.e. already shown by group
+// frames. We count ourselves as in the group only while there is a group.
+static bool InMyGroup(const VoiceUser& user, const Gw2RosterSnapshot& roster) {
+    if (roster.members.empty()) return false;
+    if (user.isSelf) return true;
+    std::string account = Gw2Account(user, roster);
+    if (account.empty()) return false;
+    std::string key = Gw2Roster::NormalizeAccount(account);
+    for (const auto& m : roster.members)
+        if (Gw2Roster::NormalizeAccount(m.account) == key) return true;
+    return false;
 }
 
 // Share the voice channel with other addons (Pie UI) every frame, whatever
@@ -572,12 +593,27 @@ static void RenderVoiceOverlay() {
     bool inVoice = !snap.users.empty() || !channelName.empty();
     bool showChannel = g_ShowChannelName && !channelName.empty();
 
+    // Overlay turned off (Discordant still feeds the bridge); shown while the
+    // options panel is open so it can be positioned for when it's turned on
+    if (g_OverlayUsers == OVERLAY_NOBODY && !optionsOpen) return;
+    bool groupFilter = g_OverlayUsers == OVERLAY_OUTSIDE_GROUP && !optionsOpen;
+
+    Gw2RosterSnapshot roster;
+    bool bracketGw2 = g_BracketMode == NAME_ACCOUNT || g_BracketMode == NAME_CHARACTER;
+    if (g_NameMode != NAME_DISCORD || bracketGw2 || groupFilter) roster = Gw2Roster::GetSnapshot();
+
     ov.visibleUsers.clear();
+    size_t outsideGroup = 0;
     for (auto& u : snap.users) {
+        if (groupFilter && InMyGroup(u, roster)) continue;
+        outsideGroup++;
         if (!g_SpeakingOnly || optionsOpen || u.speaking)
             ov.visibleUsers.push_back(std::move(u));
     }
     const auto& users = ov.visibleUsers;
+
+    // Everyone in the channel is already shown by group frames
+    if (groupFilter && !snap.users.empty() && outsideGroup == 0) return;
 
     bool showPreview = !inVoice && (optionsOpen || (!g_LockPosition && !g_HideWhenNotInVoice));
     if (!showPreview && users.empty() && !showChannel) return;  // nothing to show
@@ -587,9 +623,6 @@ static void RenderVoiceOverlay() {
     ov.userTextures.clear();
     for (const auto& u : users)
         ov.userTextures.push_back(g_ShowAvatars ? GetAvatarTexture(u) : nullptr);
-    Gw2RosterSnapshot roster;
-    bool bracketGw2 = g_BracketMode == NAME_ACCOUNT || g_BracketMode == NAME_CHARACTER;
-    if (g_NameMode != NAME_DISCORD || bracketGw2) roster = Gw2Roster::GetSnapshot();
     ov.userNames.clear();
     ov.userBrackets.clear();
     for (const auto& u : users) {
@@ -935,8 +968,11 @@ static bool PlayerNamesOptions() {
             ImGui::TextUnformatted(DisplayName(u).c_str());
             ImGui::SameLine(220.0f);
 
+            // Copied, not an iterator: choosing an entry below edits the map
+            // mid-loop, which would leave an iterator dangling
             auto link = g_Overlay->gw2Links.find(u.id);
             bool linked = link != g_Overlay->gw2Links.end();
+            std::string linkedKey = linked ? Gw2Roster::NormalizeAccount(link->second) : std::string();
             std::string preview;
             if (linked) {
                 preview = link->second;
@@ -953,7 +989,7 @@ static bool PlayerNamesOptions() {
                 }
                 for (const auto& m : roster.members) {
                     std::string label = m.character.empty() ? m.account : m.account + " (" + m.character + ")";
-                    bool selected = linked && Gw2Roster::NormalizeAccount(link->second) == Gw2Roster::NormalizeAccount(m.account);
+                    bool selected = linked && linkedKey == Gw2Roster::NormalizeAccount(m.account);
                     if (ImGui::Selectable(label.c_str(), selected)) {
                         g_Overlay->gw2Links[u.id] = m.account;
                         changed = true;
@@ -992,7 +1028,7 @@ static bool PlayerNamesOptions() {
 }
 
 static void OptionsPanel() {
-    if (!g_Discord) return;
+    if (!g_Discord || !g_Overlay) return;
     g_OptionsFrame = ImGui::GetFrameCount();
 
     ImGui::Text("Discordant - Discord Voice Overlay");
@@ -1015,6 +1051,17 @@ static void OptionsPanel() {
     ImGui::Spacing();
 
     bool changed = false;
+    ImGui::Text("Overlay shows");
+    if (ImGui::RadioButton("Everyone", g_OverlayUsers == OVERLAY_EVERYONE))                       { g_OverlayUsers = OVERLAY_EVERYONE; changed = true; }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("People outside my party/squad", g_OverlayUsers == OVERLAY_OUTSIDE_GROUP)) { g_OverlayUsers = OVERLAY_OUTSIDE_GROUP; changed = true; }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Nobody", g_OverlayUsers == OVERLAY_NOBODY))                           { g_OverlayUsers = OVERLAY_NOBODY; changed = true; }
+    if (g_OverlayUsers != OVERLAY_EVERYONE)
+        ImGui::TextDisabled("For use with group frames that show voice (e.g. Pie UI).\n"
+                            "The overlay stays visible while this panel is open so it can be positioned.");
+    ImGui::Spacing();
+
     changed |= ImGui::Checkbox("Show user avatars", &g_ShowAvatars);
     if (g_ShowAvatars) {
         ImGui::Indent();

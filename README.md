@@ -26,7 +26,7 @@ On first use, Discord will show a one-time authorization prompt. After that, the
 - **Auto-follow** — automatically tracks when you switch voice channels
 - **Customisable** — avatar size, font size, colours (including a fully transparent background), show only who's speaking, hide names, hide when not in voice, grow up or down
 - **GW2 names** — optionally show players' GW2 account or character names instead of, or in brackets alongside, their Discord names (see below)
-- **Pie UI integration** — shares who is in voice and who is speaking, so Pie UI can show it on its party/squad frames
+- **Pie UI integration** — shares who is in voice and who is speaking, so Pie UI can show it on its party/squad frames. The overlay can then list only people outside your group, or be turned off
 - **Remembers its position** between game sessions
 - **Lightweight** — no external processes, no bot, just a single DLL
 
